@@ -88,8 +88,8 @@ async def ask_kimi(history, system_prompt="", model=None, max_tokens=2048, tempe
                 r = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
                 logger.info("Kimi %s: %.1fs | %din + %dout (%dreasoning)", model, elapsed, p, c, r)
                 if not content and reasoning:
-                    logger.warning("Kimi %s: content empty, reasoning=%d", model, len(reasoning))
-                    return reasoning[:1000]
+                    logger.warning("Kimi %s: content empty, reasoning=%d tokens", model, r)
+                    return reasoning  # Возвращаем reasoning целиком, не обрезаем
                 if not content:
                     raise KimiAPIError("Empty text")
                 return content
