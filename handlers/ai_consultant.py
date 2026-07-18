@@ -195,9 +195,6 @@ async def ai_consultant_message(message: Message, state: FSMContext) -> None:
     history: list[dict] = list(data.get("ai_history") or [])
     history.append({"role": "user", "content": text})
 
-    # Освобождаем DB-сессию ДО долгого AI-запроса (60-300сек)
-    await session.commit()
-
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     try:
