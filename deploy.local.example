@@ -1,0 +1,7 @@
+# Настройки сервера (скопируйте в deploy.local)
+SERVER_HOST=123.456.789.0
+SERVER_USER=root
+SERVER_PATH=/opt/ashura-bot
+
+# SSH-ключ (необязательно; если пусто — ищется id_ed25519 или id_rsa в .ssh)
+# SSH_KEY_PATH=C:\Users\ВашеИмя\.ssh\id_ed25519

@@ -1,0 +1,10 @@
+aiogram>=3.4.1,<4.0
+SQLAlchemy[asyncio]>=2.0.0
+aiosqlite>=0.19
+python-dotenv>=1.0.0
+APScheduler>=3.10.0
+aiohttp-socks>=0.8.4
+python-socks[asyncio]>=2.4.0
+certifi>=2024.0
+redis>=5.0.0
+sentry-sdk>=2.0.0

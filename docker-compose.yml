@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: ashura_redis
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  bot:
+    build: .
+    container_name: ashura_cosm_bot
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////app/data/bot.db
+      REDIS_URL: redis://:${REDIS_PASSWORD}@localhost:6379/0
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import asyncio; from utils.health import check_db; asyncio.run(check_db()) or exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+# Автоматический бэкап: cron на хосте (настроить 1 раз):
+# crontab -e → добавить строку:
+# 0 3 * * * docker exec ashura_cosm_bot python scripts/auto_backup.py >> /var/log/ashura_backup.log 2>&1
+
+volumes:
+  redis_data:

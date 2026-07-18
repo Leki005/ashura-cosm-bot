@@ -1,0 +1,17 @@
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+backups/
+bot.db.backup_*
+venv/
+__pycache__/
+*.pyc
+logs/
+data/
+.idea/
+.vscode/
+sentry_events/
+deploy.local
+*.bak
