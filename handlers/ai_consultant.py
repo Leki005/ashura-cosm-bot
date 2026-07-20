@@ -19,7 +19,7 @@ from config import Config
 from handlers.common import show_client_home
 from keyboards import ai_consultant_keyboard, back_to_main_keyboard
 from utils.grok import GrokAPIError, ask_grok, ask_grok_vision
-from utils.helpers import check_throttle, get_user_by_telegram_id, throttled_message
+from utils.helpers import get_user_by_telegram_id
 from utils.states import AIConsultantState
 from utils.text_format import split_message
 
@@ -185,10 +185,6 @@ async def ai_consultant_message(message: Message, state: FSMContext) -> None:
 
     # Команды обрабатывают common-хендлеры (/menu, /start, /restart)
     if text.startswith("/"):
-        return
-
-    if await check_throttle(message.from_user.id):
-        await throttled_message(message)
         return
 
     data = await state.get_data()

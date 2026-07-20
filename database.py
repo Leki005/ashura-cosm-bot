@@ -52,6 +52,9 @@ class Base(DeclarativeBase):
 class User(Base):
     """Пользователь бота (клиент или админ)."""
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("bonus_balance >= 0", name="ck_user_bonus_nonneg"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
@@ -519,14 +522,54 @@ async def apply_migrations(session: AsyncSession) -> None:
     for idx_sql in [
         "CREATE INDEX IF NOT EXISTS idx_bookings_user_status ON bookings(user_id, status)",
         "CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status)",
+        "CREATE INDEX IF NOT EXISTS idx_bookings_preferred_date ON bookings(preferred_date)",
+        "CREATE INDEX IF NOT EXISTS idx_bookings_created_at ON bookings(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_bookings_completed_at ON bookings(completed_at)",
         "CREATE INDEX IF NOT EXISTS idx_bonus_tx_booking_id ON bonus_transactions(booking_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bonus_tx_booking_amount ON bonus_transactions(booking_id, amount)",
+        "CREATE INDEX IF NOT EXISTS idx_bonus_tx_user_id ON bonus_transactions(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_pd_consent_user_id ON pd_consent_logs(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_moderation ON reviews(is_published, notified_admin)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_services_name ON services(name)",
+        "CREATE INDEX IF NOT EXISTS idx_services_active ON services(is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone)",
+        "CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at)",
     ]:
         try:
             await session.execute(text(idx_sql))
-            await session.commit()
         except Exception:
             pass
+    await session.commit()
     logger.info("Миграция: индексы созданы.")
+
+    # Новые услуги (добавляются если не существуют)
+    new_services = [
+        ("Ботулинотерапия (Ботокс)", "Инъекции", "Ботулинотерапия — расслабление мышц.", 8000, 30),
+        ("Ботокс — лоб", "Инъекции", "Ботулинотерапия зоны лба.", 5000, 20),
+        ("Ботокс — межбровка", "Инъекции", "Ботулинотерапия межбровных морщин.", 4000, 20),
+        ("Ботокс — гусиные лапки", "Инъекции", "Ботулинотерапия периорбитальной зоны.", 5000, 20),
+        ("Ботокс — полное лицо", "Инъекции", "Ботулинотерапия всех зон лица.", 15000, 45),
+        ("Ботокс — гипергидроз (подмышки)", "Инъекции", "Лечение гипергидроза ботулотоксином.", 12000, 30),
+        ("Липолитики", "Инъекции", "Инъекционная липолитическая терапия.", 8000, 40),
+        ("Morpheus8 (фракционный RF-лифтинг)", "Аппаратные", "Фракционный RF-лифтинг Morpheus8.", 18000, 60),
+        ("BBL (BroadBand Light — фотоомоложение)", "Аппаратные", "Фотоомоложение BBL.", 12000, 45),
+        ("Лазерная депиляция", "Лазер", "Лазерная депиляция — общее.", 5000, 30),
+        ("Лазерная депиляция — лицо", "Лазер", "Лазерная депиляция лица.", 3000, 20),
+        ("Лазерная депиляция — тело", "Лазер", "Лазерная депиляция тела.", 6000, 45),
+        ("Консультация косметолога", "Консультации", "Персональная консультация косметолога.", 4000, 30),
+    ]
+    existing_names = set()
+    try:
+        result = await session.execute(select(Service.name))
+        existing_names = set(result.scalars().all())
+    except Exception:
+        pass
+    added = 0
+    for name, cat, desc, price, dur in new_services:
+        if name not in existing_names:
+            session.add(Service(name=name, category=cat, description=desc, price=price, duration=dur, is_active=True))
+            added += 1
+    if added:
+        await session.commit()
+        logger.info("Миграция: добавлено %d новых услуг.", added)

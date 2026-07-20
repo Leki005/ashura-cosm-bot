@@ -22,10 +22,8 @@ from config import Config
 from database import User
 from keyboards import main_menu_keyboard, restart_confirm_keyboard
 from utils.helpers import (
-    check_throttle,
     get_active_booking,
     get_user_by_telegram_id,
-    throttled_message,
     validate_name,
     validate_phone,
 )
@@ -116,11 +114,8 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) 
     Обработчик команды /start.
     Проверяет, зарегистрирован ли пользователь.
     Если нет — начинает регистрацию.
+    Throttle уже проверен в ThrottlingMiddleware — дублировать не нужно.
     """
-    if await check_throttle(message.from_user.id):
-        await throttled_message(message)
-        return
-
     await state.clear()
 
     # Deep link handling: extract payload from "/start <payload>"
@@ -144,6 +139,18 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) 
         # Existing user with consent — try deep link first
         if payload and await _dispatch_deep_link(message, state, session, user, payload):
             return
+
+        # Админ — сразу админ-панель
+        from handlers.admin import is_admin
+        if await is_admin(message.from_user.id):
+            from keyboards import admin_main_keyboard
+            await message.answer(
+                f"🔐 <b>Админ-панель {Config.SALON_NAME}</b>\n\nВыберите раздел:",
+                reply_markup=admin_main_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
         await show_client_home(
             message,
             f"👋 С возвращением, <b>{html_escape(user.name)}</b>!\n\n"
@@ -341,10 +348,6 @@ async def finish_registration(
 @router.message(Command("help"))
 async def cmd_help(message: Message, session: AsyncSession, state: FSMContext) -> None:
     """Показывает справку по боту."""
-    if await check_throttle(message.from_user.id):
-        await throttled_message(message)
-        return
-
     await state.clear()
 
     await show_client_home(
@@ -393,10 +396,6 @@ async def cmd_menu(
     message: Message, state: FSMContext, session: AsyncSession,
 ) -> None:
     """В любой момент возвращает клиента в главное меню."""
-    if await check_throttle(message.from_user.id):
-        await throttled_message(message)
-        return
-
     from handlers.privacy import show_consent_for_existing_user
 
     await state.clear()
@@ -441,10 +440,6 @@ async def cmd_restart(
     /restart — сброс текущего диалога.
     Доступен в любой момент через кнопку внизу экрана.
     """
-    if await check_throttle(message.from_user.id):
-        await throttled_message(message)
-        return
-
     user = await get_user_by_telegram_id(session, message.from_user.id)
     if user and await get_active_booking(session, user.id):
         await message.answer(

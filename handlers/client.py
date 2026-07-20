@@ -70,10 +70,10 @@ from keyboards import (
 from utils.helpers import (
     ACTIVE_BOOKING_STATUSES,
     add_bonus_transaction,
+    parse_callback_int,
     build_anamnesis_message,
     calculate_max_bonus_discount,
     cancel_booking_by_id,
-    check_throttle,
     format_anamnesis,
     format_active_booking_prompt,
     format_booking_card,
@@ -96,7 +96,6 @@ from utils.helpers import (
     notify_admin_service_merged,
     notify_client_booking_confirmed,
     send_message_to_owner,
-    throttled_message,
     check_booking_date_allowed,
     check_booking_time_allowed,
     validate_booking_date,
@@ -351,10 +350,17 @@ async def anamnesis_answer(callback: CallbackQuery, state: FSMContext) -> None:
         await show_anamnesis_summary(callback.message, answers)
     else:
         # Обновляем текст и кнопки в одном сообщении
-        await callback.message.edit_text(
-            build_anamnesis_message(current_index, answers),
-            reply_markup=anamnesis_keyboard(current_index, answers, anam_token=saved_token),
-        )
+        from aiogram.exceptions import TelegramBadRequest
+        try:
+            await callback.message.edit_text(
+                build_anamnesis_message(current_index, answers),
+                reply_markup=anamnesis_keyboard(current_index, answers, anam_token=saved_token),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                build_anamnesis_message(current_index, answers),
+                reply_markup=anamnesis_keyboard(current_index, answers, anam_token=saved_token),
+            )
 
     await callback.answer()
 
@@ -747,8 +753,14 @@ async def _finalize_booking(
             bonus_used=bonus_used,
         )
         session.add(booking)
-        await session.flush()
-        await session.commit()  # Гарантируем сохранение ДО показа успеха клиенту
+        try:
+            await session.flush()  # booking.id доступен после flush; commit сделает middleware
+        except IntegrityError:
+            await message.answer(
+                "⚠️ У вас уже есть активная запись. Дождитесь её завершения.",
+                reply_markup=back_to_main_keyboard(),
+            )
+            return
 
         if bonus_used > 0:
             await add_bonus_transaction(
@@ -918,7 +930,10 @@ async def show_service_detail(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Показывает детальную карточку услуги."""
-    service_id = int(callback.data.replace("svc_", ""))
+    service_id = parse_callback_int(callback.data, "svc_")
+    if service_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     result = await session.execute(select(Service).where(Service.id == service_id))
     service = result.scalar_one_or_none()
 
@@ -942,17 +957,22 @@ async def show_service_detail(
 @router.callback_query(F.data.startswith("book_svc_"))
 async def book_service(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     """Начало записи на конкретную услугу."""
-    service_id = int(callback.data.replace("book_svc_", ""))
+    service_id = parse_callback_int(callback.data, "book_svc_")
+    if service_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
 
     user = await get_user_by_telegram_id(session, callback.from_user.id)
     if not user:
         await callback.answer("Сначала пройдите регистрацию: /start", show_alert=True)
         return
 
-    svc_result = await session.execute(select(Service).where(Service.id == service_id))
+    svc_result = await session.execute(
+        select(Service).where(Service.id == service_id, Service.is_active == True)
+    )
     service = svc_result.scalar_one_or_none()
     if not service:
-        await callback.answer("Услуга не найдена.", show_alert=True)
+        await callback.answer("Услуга недоступна.", show_alert=True)
         return
 
     active_booking = await get_active_booking(session, user.id)
@@ -977,9 +997,13 @@ async def merge_combine(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Показать текущую запись и запросить подтверждение объединения."""
-    parts = callback.data.split("_")
-    booking_id = int(parts[2])
-    service_id = int(parts[3])
+    import re
+    match = re.match(r"^merge_combine_(\d+)_(\d+)$", callback.data)
+    if not match:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    booking_id = int(match.group(1))
+    service_id = int(match.group(2))
 
     user = await get_user_by_telegram_id(session, callback.from_user.id)
     if not user:
@@ -1312,7 +1336,10 @@ async def merge_separate(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Запись на другое время невозможна — уже есть активная запись."""
-    service_id = int(callback.data.replace("merge_separate_", ""))
+    service_id = parse_callback_int(callback.data, "merge_separate_")
+    if service_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     user = await get_user_by_telegram_id(session, callback.from_user.id)
     if not user:
         await callback.answer("Сначала пройдите регистрацию: /start", show_alert=True)
@@ -1338,11 +1365,19 @@ async def merge_separate(
         InlineKeyboardButton(text="🔙 В меню", callback_data="menu_main"),
     )
 
-    await callback.message.edit_text(
-        "⚠️ У вас уже есть активная запись.\n\n"
-        "Отмените её в «Мои записи» или совместите услуги в один визит.",
-        reply_markup=builder.as_markup(),
-    )
+    from aiogram.exceptions import TelegramBadRequest
+    try:
+        await callback.message.edit_text(
+            "⚠️ У вас уже есть активная запись.\n\n"
+            "Отмените её в «Мои записи» или совместите услуги в один визит.",
+            reply_markup=builder.as_markup(),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            "⚠️ У вас уже есть активная запись.\n\n"
+            "Отмените её в «Мои записи» или совместите услуги в один визит.",
+            reply_markup=builder.as_markup(),
+        )
     await callback.answer()
 
 
@@ -1355,7 +1390,10 @@ async def process_bonus_amount(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Обрабатывает выбор количества бонусов."""
-    amount = int(callback.data.replace("bonus_use_", ""))
+    amount = parse_callback_int(callback.data, "bonus_use_")
+    if amount is None or amount <= 0:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
 
     # Серверная валидация: баланс + лимит 50%
     user = await get_user_by_telegram_id(session, callback.from_user.id)
@@ -1473,7 +1511,10 @@ async def followup_text_start(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Клиент хочет рассказать подробнее."""
-    booking_id = int(callback.data.removeprefix("followup_text_"))
+    booking_id = parse_callback_int(callback.data, "followup_text_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     booking = await _get_completed_booking(
         session, booking_id, callback.from_user.id,
     )
@@ -1502,7 +1543,10 @@ async def followup_question(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Вопрос после процедуры — переводим в консультацию."""
-    booking_id = int(callback.data.removeprefix("followup_question_"))
+    booking_id = parse_callback_int(callback.data, "followup_question_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     booking = await _get_completed_booking(
         session, booking_id, callback.from_user.id,
     )
@@ -1637,9 +1681,8 @@ async def review_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(ReviewState.waiting_rating, F.data.startswith("rate_"))
 async def review_rating(callback: CallbackQuery, state: FSMContext) -> None:
     """Получает рейтинг, просит текст."""
-    try:
-        rating = int(callback.data.replace("rate_", ""))
-    except ValueError:
+    rating = parse_callback_int(callback.data, "rate_")
+    if rating is None:
         await callback.answer("Ошибка.", show_alert=True)
         return
     if rating not in range(1, 6):
@@ -1764,7 +1807,10 @@ async def review_edit_start(callback: CallbackQuery, state: FSMContext, session:
     from datetime import timedelta
     from utils.helpers import now_salon
 
-    review_id = int(callback.data.replace("review_edit_", ""))
+    review_id = parse_callback_int(callback.data, "review_edit_")
+    if review_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     result = await session.execute(select(Review).where(Review.id == review_id))
     review = result.scalar_one_or_none()
 
@@ -1809,7 +1855,10 @@ async def review_edit_start(callback: CallbackQuery, state: FSMContext, session:
 @router.callback_query(ReviewState.waiting_rating, F.data.startswith("edit_rate_"))
 async def review_edit_rating(callback: CallbackQuery, state: FSMContext) -> None:
     """Новый рейтинг при редактировании."""
-    rating = int(callback.data.replace("edit_rate_", ""))
+    rating = parse_callback_int(callback.data, "edit_rate_")
+    if rating is None or rating not in range(1, 6):
+        await callback.answer("Ошибка.", show_alert=True)
+        return
     await state.update_data(rating=rating)
 
     await callback.message.answer(
@@ -1873,7 +1922,10 @@ async def faq_list(callback: CallbackQuery, session: AsyncSession) -> None:
 )
 async def faq_detail(callback: CallbackQuery, session: AsyncSession) -> None:
     """Показывает ответ на конкретный FAQ."""
-    faq_id = int(callback.data.split("_", 1)[1])
+    faq_id = parse_callback_int(callback.data, "faq_")
+    if faq_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     result = await session.execute(select(FAQ).where(FAQ.id == faq_id))
     faq = result.scalar_one_or_none()
 
@@ -1882,9 +1934,10 @@ async def faq_detail(callback: CallbackQuery, session: AsyncSession) -> None:
         return
 
     from utils.text_format import split_message, wrap_lines
+    from html import escape as html_escape
 
-    answer_text = wrap_lines(faq.answer, width=42)
-    header = f"❓ {wrap_lines(faq.question, width=42)}\n\n"
+    answer_text = wrap_lines(html_escape(faq.answer), width=42)
+    header = f"❓ {wrap_lines(html_escape(faq.question), width=42)}\n\n"
     chunks = split_message(header + answer_text)
     for i, chunk in enumerate(chunks):
         markup = faq_detail_keyboard() if i == len(chunks) - 1 else None
@@ -1895,15 +1948,22 @@ async def faq_detail(callback: CallbackQuery, session: AsyncSession) -> None:
 @router.callback_query(F.data.startswith("faq_page_"))
 async def faq_page(callback: CallbackQuery, session: AsyncSession) -> None:
     """Пагинация FAQ."""
-    page = int(callback.data.replace("faq_page_", ""))
+    page = parse_callback_int(callback.data, "faq_page_")
+    if page is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     result = await session.execute(
         select(FAQ).where(FAQ.is_active == True).order_by(FAQ.order)
     )
     faqs = result.scalars().all()
 
-    await callback.message.edit_reply_markup(
-        reply_markup=faq_list_keyboard(list(faqs), page)
-    )
+    from aiogram.exceptions import TelegramBadRequest
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=faq_list_keyboard(list(faqs), page)
+        )
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 
@@ -2223,7 +2283,10 @@ async def cancel_booking_start(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Начало отмены — показываем подтверждение (без ввода причины)."""
-    booking_id = int(callback.data.replace("cancel_book_", ""))
+    booking_id = parse_callback_int(callback.data, "cancel_book_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
 
     user = await get_user_by_telegram_id(session, callback.from_user.id)
     if not user:
@@ -2260,7 +2323,10 @@ async def cancel_booking_confirm(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Подтверждённая отмена — статус cancelled сохраняется в БД (commit в middleware)."""
-    booking_id = int(callback.data.replace("cancel_confirm_", ""))
+    booking_id = parse_callback_int(callback.data, "cancel_confirm_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
 
     user = await get_user_by_telegram_id(session, callback.from_user.id)
     if not user:
@@ -2327,8 +2393,14 @@ async def cancel_booking_confirm(
     )
     conf_tx = conf_tx_result.scalar_one_or_none()
     if conf_tx and conf_tx.amount > 0:
+        # Атомарный отзыв — защита от race condition
+        from sqlalchemy import update as sa_update, func as sa_func
+        await session.execute(
+            sa_update(User)
+            .where(User.id == user.id)
+            .values(bonus_balance=sa_func.max(0, User.bonus_balance - conf_tx.amount))
+        )
         await session.refresh(user)
-        user.bonus_balance = max(0, user.bonus_balance - conf_tx.amount)
         await add_bonus_transaction(
             session,
             user.id,
@@ -2397,9 +2469,6 @@ async def ai_auto_help(message: Message, state: FSMContext, session: AsyncSessio
 
     user = await get_user_by_telegram_id(session, message.from_user.id)
     if not user:
-        return
-
-    if await check_throttle(message.from_user.id):
         return
 
     await message.answer(

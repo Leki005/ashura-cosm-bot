@@ -60,7 +60,7 @@ class Config:
     BOOKING_MIN_LEAD_MINUTES: int = 15
 
     # --- Отмена: минимум часов до приёма (иначе нельзя отменить через бота) ---
-    CANCEL_DEADLINE_HOURS: int = int(os.getenv("CANCEL_DEADLINE_HOURS", "6"))
+    CANCEL_DEADLINE_HOURS: int = int(os.getenv("CANCEL_DEADLINE_HOURS", "2"))
 
     # --- Напоминания ---
     FOLLOWUP_AFTER_HOURS: int = 1    # Опрос после процедуры (через N часов)

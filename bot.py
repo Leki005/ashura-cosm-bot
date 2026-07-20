@@ -96,10 +96,14 @@ async def notify_error(title: str, details: str) -> None:
     try:
         from html import escape as html_esc
         # Редактируем секреты из traceback
+        import re as _re
         redacted = details
-        for secret in (Config.BOT_TOKEN, Config.XAI_API_KEY, Config.KIMI_API_KEY):
-            if secret and len(secret) > 8:
-                redacted = redacted.replace(secret, secret[:4] + "***REDACTED***")
+        for secret in (Config.BOT_TOKEN, Config.XAI_API_KEY, Config.KIMI_API_KEY,
+                       Config.KIMI_PROXY, Config.SENTRY_DSN):
+            if secret and len(secret) > 4:
+                redacted = redacted.replace(secret, secret[:3] + "***")
+        redacted = _re.sub(r'Bearer\s+\S+', 'Bearer ***REDACTED***', redacted)
+        redacted = _re.sub(r'Authorization:\s*\S+', 'Authorization: ***REDACTED***', redacted)
         escaped_details = html_esc(redacted)
         text = (
             f"🚨 <b>{html_esc(title)}</b>\n\n"
@@ -229,6 +233,13 @@ async def send_reminders(bot: Bot) -> None:
     Проверяет и отправляет напоминания клиентам.
     Вызывается каждые 5 минут шедулером.
     """
+    try:
+        await _send_reminders_inner(bot)
+    except Exception:
+        logger.exception("send_reminders: непредвиденная ошибка")
+
+
+async def _send_reminders_inner(bot: Bot) -> None:
     from datetime import datetime, timedelta, timezone
     from database import Booking, User
     from utils.helpers import format_phone, now_salon
@@ -437,7 +448,15 @@ async def _send_reminder_2h(bot: Bot, session, booking) -> None:
 
 async def send_reviews_to_moderation(bot: Bot) -> None:
     """Отправляет админу отзывы, у которых истёк 30-минутный окно редактирования."""
+    try:
+        await _send_reviews_to_moderation_inner(bot)
+    except Exception:
+        logger.exception("send_reviews_to_moderation: непредвиденная ошибка")
+
+
+async def _send_reviews_to_moderation_inner(bot: Bot) -> None:
     from datetime import datetime, timedelta, timezone
+    from sqlalchemy.orm import joinedload
     from database import Review, User
     from keyboards import admin_review_moderation_keyboard
     from utils.helpers import now_salon
@@ -448,20 +467,18 @@ async def send_reviews_to_moderation(bot: Bot) -> None:
     async with async_session() as session:
         result = await session.execute(
             select(Review)
+            .options(joinedload(Review.user))
             .where(Review.is_published == False)
             .where(Review.notified_admin == False)
         )
-        reviews = result.scalars().all()
+        reviews = result.scalars().unique().all()
 
         for review in reviews:
             if now - review.created_at < edit_window:
                 continue
 
             # Окно редактирования истекло — отправляем на модерацию
-            user_result = await session.execute(
-                select(User).where(User.id == review.user_id)
-            )
-            user = user_result.scalar_one_or_none()
+            user = review.user
             if not user:
                 continue
 
@@ -578,6 +595,11 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher) -> None:
     if scheduler:
         scheduler.shutdown()
         logger.info("Шедулер остановлен.")
+
+    # Закрываем соединения с БД
+    from database import engine
+    await engine.dispose()
+    logger.info("DB engine disposed.")
 
     # Закрываем переиспользуемую HTTP-сессию Grok API
     from utils import grok as grok_module

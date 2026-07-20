@@ -36,6 +36,10 @@ class PIICleanup:
     @staticmethod
     async def run_all() -> dict:
         """Run all PII cleanup tasks."""
-        return {
-            'bookings_anonymized': await PIICleanup.anonymize_old_bookings(),
-        }
+        try:
+            return {
+                'bookings_anonymized': await PIICleanup.anonymize_old_bookings(),
+            }
+        except Exception:
+            logger.exception("PIICleanup.run_all: непредвиденная ошибка")
+            return {'bookings_anonymized': 0, 'error': True}

@@ -199,7 +199,7 @@ async def skin_why(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "skin_go")
 async def skin_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SkinAnamnesisState.in_progress)
-    await state.update_data(skin_q=1, skin_answers={}, skin_selected=set())
+    await state.update_data(skin_q=1, skin_answers={}, skin_selected=[])
     await _ask_question(callback.message, state)
     await callback.answer()
 
@@ -222,7 +222,7 @@ async def skin_restart(callback: CallbackQuery, state: FSMContext) -> None:
 async def skin_next(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     q = data.get("skin_q", 1)
-    await state.update_data(skin_q=q + 1, skin_selected=set())
+    await state.update_data(skin_q=q + 1, skin_selected=[])
     await _ask_question(callback.message, state)
     await callback.answer()
 
@@ -233,7 +233,7 @@ async def skin_back(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     q = data.get("skin_q", 1)
     if q > 1:
-        await state.update_data(skin_q=q - 1, skin_selected=set())
+        await state.update_data(skin_q=q - 1, skin_selected=[])
         await _ask_question(callback.message, state)
     else:
         await callback.answer("Это первый вопрос", show_alert=True)
@@ -363,7 +363,7 @@ async def handle_season(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _q4_problems(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    selected = data.get("skin_selected", set())
+    selected = set(data.get("skin_selected", []))
     await message.answer(
         f"{_progress(4)}\nКакие проблемы беспокоят прямо сейчас?\n(можно несколько)",
         reply_markup=skin_problems_keyboard(selected),
@@ -374,7 +374,7 @@ async def _q4_problems(message: Message, state: FSMContext) -> None:
 async def handle_problems(callback: CallbackQuery, state: FSMContext) -> None:
     val = callback.data.replace("skprob_", "")
     data = await state.get_data()
-    selected = set(data.get("skin_selected", set()))
+    selected = set(data.get("skin_selected", []))
 
     if val == "done":
         if not selected:
@@ -382,7 +382,7 @@ async def handle_problems(callback: CallbackQuery, state: FSMContext) -> None:
             return
         answers = data.get("skin_answers", {})
         answers["problems"] = list(selected)
-        await state.update_data(skin_answers=answers, skin_selected=set())
+        await state.update_data(skin_answers=answers, skin_selected=[])
         await callback.message.answer(
             f"Зафиксировано: {len(selected)} проблем. Переходим к локализации ➡️"
         )
@@ -396,7 +396,7 @@ async def handle_problems(callback: CallbackQuery, state: FSMContext) -> None:
             selected.add(val)
         else:
             selected.discard(val) if val in selected else selected.add(val)
-        await state.update_data(skin_selected=selected)
+        await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_problems_keyboard(selected))
     await callback.answer()
 
@@ -407,7 +407,7 @@ async def handle_problems(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _q5_areas(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    selected = data.get("skin_selected", set())
+    selected = set(data.get("skin_selected", []))
     await message.answer(
         f"{_progress(5)}\nГде именно проявляются проблемы? 📍",
         reply_markup=skin_areas_keyboard(selected),
@@ -418,7 +418,7 @@ async def _q5_areas(message: Message, state: FSMContext) -> None:
 async def handle_areas(callback: CallbackQuery, state: FSMContext) -> None:
     val = callback.data.replace("skarea_", "")
     data = await state.get_data()
-    selected = set(data.get("skin_selected", set()))
+    selected = set(data.get("skin_selected", []))
 
     if val == "done":
         if not selected:
@@ -426,13 +426,13 @@ async def handle_areas(callback: CallbackQuery, state: FSMContext) -> None:
             return
         answers = data.get("skin_answers", {})
         answers["problem_areas"] = list(selected)
-        await state.update_data(skin_answers=answers, skin_selected=set())
+        await state.update_data(skin_answers=answers, skin_selected=[])
         await callback.message.answer("Отлично! Теперь уточним давность ➡️")
         await state.update_data(skin_q=6)
         await _ask_question(callback.message, state)
     else:
         selected.discard(val) if val in selected else selected.add(val)
-        await state.update_data(skin_selected=selected)
+        await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_areas_keyboard(selected))
     await callback.answer()
 
@@ -500,7 +500,7 @@ async def handle_inflammation(callback: CallbackQuery, state: FSMContext) -> Non
 
 async def _q8_home_care(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    selected = data.get("skin_selected", set())
+    selected = set(data.get("skin_selected", []))
     await message.answer(
         f"{_progress(8)}\nЧто используешь ежедневно из ухода?\n(можно несколько)",
         reply_markup=skin_home_care_keyboard(selected),
@@ -511,7 +511,7 @@ async def _q8_home_care(message: Message, state: FSMContext) -> None:
 async def handle_home_care(callback: CallbackQuery, state: FSMContext) -> None:
     val = callback.data.replace("skcare_", "")
     data = await state.get_data()
-    selected = set(data.get("skin_selected", set()))
+    selected = set(data.get("skin_selected", []))
 
     if val == "write":
         await state.set_state(SkinAnamnesisState.waiting_text)
@@ -526,7 +526,7 @@ async def handle_home_care(callback: CallbackQuery, state: FSMContext) -> None:
             return
         answers = data.get("skin_answers", {})
         answers["home_care"] = list(selected)
-        await state.update_data(skin_answers=answers, skin_selected=set())
+        await state.update_data(skin_answers=answers, skin_selected=[])
         if "nothing" in selected:
             await callback.message.answer(
                 "Ого! Даже базовый уход из 3 шагов творит чудеса:\n"
@@ -543,7 +543,7 @@ async def handle_home_care(callback: CallbackQuery, state: FSMContext) -> None:
             selected.add(val)
         else:
             selected.discard(val) if val in selected else selected.add(val)
-        await state.update_data(skin_selected=selected)
+        await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_home_care_keyboard(selected))
     await callback.answer()
 
@@ -554,7 +554,7 @@ async def handle_home_care(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _q9_pro_care(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    selected = data.get("skin_selected", set())
+    selected = set(data.get("skin_selected", []))
     await message.answer(
         f"{_progress(9)}\nКакие профессиональные процедуры уже пробовала?\n(можно несколько)",
         reply_markup=skin_pro_care_keyboard(selected),
@@ -565,7 +565,7 @@ async def _q9_pro_care(message: Message, state: FSMContext) -> None:
 async def handle_pro_care(callback: CallbackQuery, state: FSMContext) -> None:
     val = callback.data.replace("skpro_", "")
     data = await state.get_data()
-    selected = set(data.get("skin_selected", set()))
+    selected = set(data.get("skin_selected", []))
 
     if val == "write":
         await state.set_state(SkinAnamnesisState.waiting_text)
@@ -580,7 +580,7 @@ async def handle_pro_care(callback: CallbackQuery, state: FSMContext) -> None:
             return
         answers = data.get("skin_answers", {})
         answers["pro_care"] = list(selected)
-        await state.update_data(skin_answers=answers, skin_selected=set())
+        await state.update_data(skin_answers=answers, skin_selected=[])
         await callback.message.answer("Переходим к аллергиям ➡️")
         await state.update_data(skin_q=10)
         await _ask_question(callback.message, state)
@@ -592,7 +592,7 @@ async def handle_pro_care(callback: CallbackQuery, state: FSMContext) -> None:
             selected.add(val)
         else:
             selected.discard(val) if val in selected else selected.add(val)
-        await state.update_data(skin_selected=selected)
+        await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_pro_care_keyboard(selected))
     await callback.answer()
 
@@ -633,7 +633,7 @@ async def handle_allergy(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _q11_goals_budget(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    selected = data.get("skin_selected", set())
+    selected = set(data.get("skin_selected", []))
     await message.answer(
         f"{_progress(11)}\nЧего хочешь добиться?\n(можно несколько)",
         reply_markup=skin_goals_keyboard(selected),
@@ -644,7 +644,7 @@ async def _q11_goals_budget(message: Message, state: FSMContext) -> None:
 async def handle_goals(callback: CallbackQuery, state: FSMContext) -> None:
     val = callback.data.replace("skgoal_", "")
     data = await state.get_data()
-    selected = set(data.get("skin_selected", set()))
+    selected = set(data.get("skin_selected", []))
 
     if val == "done":
         if not selected:
@@ -652,12 +652,12 @@ async def handle_goals(callback: CallbackQuery, state: FSMContext) -> None:
             return
         answers = data.get("skin_answers", {})
         answers["goals"] = list(selected)
-        await state.update_data(skin_answers=answers, skin_selected=set())
+        await state.update_data(skin_answers=answers, skin_selected=[])
         # Сразу к бюджету
         await message_answer_budget(callback.message)
     else:
         selected.discard(val) if val in selected else selected.add(val)
-        await state.update_data(skin_selected=selected)
+        await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_goals_keyboard(selected))
     await callback.answer()
 
@@ -861,13 +861,13 @@ async def handle_text_input(message: Message, state: FSMContext) -> None:
         await message.answer("Переходим к целям ➡️", reply_markup=skin_continue_keyboard())
     elif field == "home_care_text":
         answers["home_care_text"] = text
-        await state.update_data(skin_answers=answers, skin_q=9, skin_selected=set())
+        await state.update_data(skin_answers=answers, skin_q=9, skin_selected=[])
         await state.set_state(SkinAnamnesisState.in_progress)
         await message.answer("✅ Записала! Переходим к процедурам ➡️")
         await _ask_question(message, state)
     elif field == "pro_care_text":
         answers["pro_care_text"] = text
-        await state.update_data(skin_answers=answers, skin_q=10, skin_selected=set())
+        await state.update_data(skin_answers=answers, skin_q=10, skin_selected=[])
         await state.set_state(SkinAnamnesisState.in_progress)
         await message.answer("✅ Записала! Переходим к аллергиям ➡️")
         await _ask_question(message, state)

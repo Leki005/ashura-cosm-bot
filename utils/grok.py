@@ -108,19 +108,33 @@ def load_skin_prompt() -> str:
 
 
 def _sanitize_user_message(text: str) -> str:
-    """Basic prompt injection defense — strips common injection patterns."""
+    """Prompt injection defense — normalize Unicode + strip injection patterns."""
+    import re
+    import unicodedata
+    # Normalize Unicode (NFKC) — убирает zero-width, homoglyphs
+    text = unicodedata.normalize('NFKC', text)
+    # Длина
+    if len(text) > 1500:
+        text = text[:1500] + " [обрезано]"
+    # Injection patterns (case-insensitive, normalized)
     injections = [
-        'ignore previous instructions',
-        'ignore all previous',
-        'you are now',
-        'new instructions:',
-        'system prompt:',
-        'forget everything',
-        'disregard',
+        r'ignore\s+(all\s+)?previous',
+        r'you\s+are\s+now',
+        r'new\s+instructions?\s*:',
+        r'system\s+prompt\s*:',
+        r'forget\s+everything',
+        r'disregard\s+(all|previous|prior)',
+        r'override\s+(your|all)',
+        r'act\s+as\s+if',
+        r'pretend\s+you\s+(are|were)',
+        r'reveal\s+(your|the)\s+(system|initial|original)',
+        r'repeat\s+(the|your)\s+(system|first|initial)',
+        r'what\s+(are|were)\s+your\s+(instructions|rules|system)',
+        r'translate\s+(your|the)\s+(system|prompt)',
     ]
     lower = text.lower()
-    for injection in injections:
-        if injection in lower:
+    for pattern in injections:
+        if re.search(pattern, lower):
             return '[Сообщение отфильтровано]'
     return text
 

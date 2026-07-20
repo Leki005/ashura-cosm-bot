@@ -55,6 +55,7 @@ from keyboards import (
 from utils.audit import log_admin_action
 from utils.helpers import (
     add_bonus_transaction,
+    parse_callback_int,
     format_booking_services_line,
     format_phone,
     format_price,
@@ -97,7 +98,7 @@ class AdminOnlyMiddleware:
         if not user:
             return None
         
-        if user.id not in (Config.ADMIN_ID, Config.owner_id()):
+        if user.id != Config.ADMIN_ID:
             if hasattr(event, 'answer'):
                 try:
                     await event.answer('⛔ Нет доступа!', show_alert=True)
@@ -135,8 +136,7 @@ STATUS_NAMES = {
 
 async def is_admin(telegram_id: int) -> bool:
     """Проверяет, является ли пользователь администратором."""
-    # OWNER_ID и ADMIN_ID — оба имеют доступ к админке
-    return telegram_id in (Config.ADMIN_ID, Config.owner_id())
+    return telegram_id == Config.ADMIN_ID
 
 
 async def _booking_status_counts(session: AsyncSession) -> dict[str, int]:
@@ -258,8 +258,21 @@ async def _confirm_booking(
     Возвращает (доставлено_уведомление, сумма_бонусов).
     """
     from utils.helpers import now_salon
-    booking.status = STATUS_CONFIRMED
-    booking.confirmed_at = now_salon()
+    from sqlalchemy import update as sa_update
+    # Атомарное обновление статуса — защита от double-confirm
+    result = await session.execute(
+        sa_update(Booking)
+        .where(Booking.id == booking.id, Booking.status == STATUS_PENDING)
+        .values(status=STATUS_CONFIRMED, confirmed_at=now_salon())
+    )
+    if result.rowcount == 0:
+        return False, 0  # уже подтверждена другим запросом
+    # Перезагружаем booking вместе с user relationship
+    from sqlalchemy.orm import joinedload
+    fresh = await session.execute(
+        select(Booking).options(joinedload(Booking.user)).where(Booking.id == booking.id)
+    )
+    booking = fresh.scalar_one()
 
     bonus_granted = await grant_confirmation_bonus(session, booking)
 
@@ -431,7 +444,10 @@ async def admin_accept_quick(
 ) -> None:
     """Подтверждает заявку на дату, которую выбрал клиент."""
     await callback.answer()
-    booking_id = int(callback.data.removeprefix("admin_accept_quick_"))
+    booking_id = parse_callback_int(callback.data, "admin_accept_quick_")
+    if booking_id is None:
+        await callback.message.answer("⚠️ Ошибка данных.")
+        return
     booking = await _fetch_booking(session, booking_id)
     if not booking:
         await callback.message.answer("⚠️ Заявка не найдена.")
@@ -490,7 +506,10 @@ async def admin_force_accept(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Подтверждение заявки при коллизии (после предупреждения)."""
-    booking_id = int(callback.data.removeprefix("admin_force_accept_"))
+    booking_id = parse_callback_int(callback.data, "admin_force_accept_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     booking = await _fetch_booking(session, booking_id)
     if not booking:
         await callback.answer("Заявка не найдена.", show_alert=True)
@@ -527,7 +546,10 @@ async def admin_accept_custom(
     callback: CallbackQuery, state: FSMContext,
 ) -> None:
     """Указать другую дату приёма — переводит в FSM."""
-    booking_id = int(callback.data.removeprefix("admin_accept_custom_"))
+    booking_id = parse_callback_int(callback.data, "admin_accept_custom_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     await state.update_data(accept_booking_id=booking_id)
 
     await callback.message.answer(
@@ -582,7 +604,10 @@ async def admin_accept_booking(
     await callback.message.answer(
         f"✅ <b>Принятие заявки #{booking_id}</b>\n\n"
         f"Напишите дату и время приёма:\n"
-        f"(например: '15 июня, 14:00' или 'завтра в 10:00')",
+        f"Формат: <b>ДД.ММ.ГГГГ</b> или <b>ДД.ММ.ГГГГ ЧЧ:ММ</b>\n\n"
+        f"Примеры:\n"
+        f"• 15.07.2026\n"
+        f"• 15.07.2026 14:00",
         parse_mode="HTML",
     )
     await state.set_state(AdminAcceptState.waiting_datetime)
@@ -603,6 +628,11 @@ async def process_accept_datetime(
     booking = await _fetch_booking(session, booking_id)
     if not booking:
         await msg.answer("⚠️ Заявка не найдена.")
+        await state.clear()
+        return
+
+    if booking.status != STATUS_PENDING:
+        await msg.answer(f"⚠️ Заявка #{booking_id} уже в статусе «{booking.status}». Нельзя подтвердить.")
         await state.clear()
         return
 
@@ -670,7 +700,10 @@ async def admin_reject_booking(
     callback: CallbackQuery, state: FSMContext,
 ) -> None:
     """Запрашивает причину отклонения — затем уведомит клиента."""
-    booking_id = int(callback.data.removeprefix("admin_reject_"))
+    booking_id = parse_callback_int(callback.data, "admin_reject_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     await state.update_data(reject_booking_id=booking_id)
 
     await callback.message.answer(
@@ -709,7 +742,18 @@ async def process_reject_reason(
 
     reason = html_escape(msg.text.strip())
     admin_id = msg.from_user.id
-    booking.status = STATUS_CANCELLED
+    # Атомарный reject — защита от race condition
+    from sqlalchemy import update as sa_update
+    result = await session.execute(
+        sa_update(Booking)
+        .where(Booking.id == booking.id, Booking.status.in_((STATUS_PENDING, STATUS_CONFIRMED)))
+        .values(status=STATUS_CANCELLED)
+    )
+    if result.rowcount == 0:
+        await msg.answer(f"⚠️ Заявка #{booking_id} уже обработана.")
+        await state.clear()
+        return
+    await session.refresh(booking)
 
     # Читаем до await — relationship уже подгружен joinedload в _fetch_booking
     user = booking.user
@@ -803,7 +847,10 @@ async def admin_done_booking(
     callback: CallbackQuery, state: FSMContext,
 ) -> None:
     """Начинает процесс завершения заявки — переводит в FSM."""
-    booking_id = int(callback.data.removeprefix("admin_done_"))
+    booking_id = parse_callback_int(callback.data, "admin_done_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     await state.update_data(done_booking_id=booking_id)
 
     await callback.message.answer(
@@ -853,10 +900,18 @@ async def process_done_amount(
         return
 
     from utils.helpers import now_salon
-    booking.status = STATUS_COMPLETED
-    booking.completed_at = now_salon()
-    booking.total_amount = amount
-    await session.flush()
+    # Атомарный complete — защита от race condition
+    from sqlalchemy import update as sa_update
+    result = await session.execute(
+        sa_update(Booking)
+        .where(Booking.id == booking.id, Booking.status == STATUS_CONFIRMED)
+        .values(status=STATUS_COMPLETED, completed_at=now_salon(), total_amount=amount)
+    )
+    if result.rowcount == 0:
+        await msg.answer(f"⚠️ Заявка #{booking_id} уже обработана.")
+        await state.clear()
+        return
+    await session.refresh(booking)
 
     log_admin_action(msg.from_user.id, 'complete_booking', f'#{booking_id}', f'amount={amount}')
 
@@ -1019,7 +1074,10 @@ async def admin_publish_review(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Публикует отзыв."""
-    review_id = int(callback.data.replace("rev_pub_", ""))
+    review_id = parse_callback_int(callback.data, "rev_pub_")
+    if review_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     result = await session.execute(
         select(Review).where(Review.id == review_id)
     )
@@ -1037,7 +1095,10 @@ async def admin_reject_review(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Отклоняет отзыв (удаляет)."""
-    review_id = int(callback.data.replace("rev_rej_", ""))
+    review_id = parse_callback_int(callback.data, "rev_rej_")
+    if review_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     result = await session.execute(
         select(Review).where(Review.id == review_id)
     )
@@ -1234,6 +1295,7 @@ async def _send_broadcast(
             await bot.send_message(
                 chat_id=user.telegram_id,
                 text=text,
+                parse_mode=None,  # plain text — безопасно, без HTML injection
             )
             sent += 1
         except TelegramRetryAfter as e:
@@ -1244,6 +1306,7 @@ async def _send_broadcast(
                 await bot.send_message(
                     chat_id=user.telegram_id,
                     text=text,
+                    parse_mode=None,
                 )
                 sent += 1
             except Exception:
@@ -1316,7 +1379,7 @@ async def admin_faq_menu(callback: CallbackQuery, session: AsyncSession) -> None
         text += f"Всего вопросов: {len(faqs)}\n\n"
         for faq_item in faqs:
             status = "✅" if faq_item.is_active else "❌"
-            text += f"{status} {faq_item.id}. {faq_item.question[:40]}...\n"
+            text += f"{status} {faq_item.id}. {html_escape(faq_item.question[:40])}...\n"
     else:
         text += "<i>Пока нет вопросов.</i>\n"
 
@@ -1733,14 +1796,21 @@ async def _apply_bonus_revoke(
     if amount <= 0:
         return False, "Сумма должна быть больше нуля."
 
-    if user.bonus_balance < amount:
+    # Атомарное списание — защита от race condition
+    from sqlalchemy import update as sa_update
+    result = await session.execute(
+        sa_update(User)
+        .where(User.id == user.id, User.bonus_balance >= amount)
+        .values(bonus_balance=User.bonus_balance - amount)
+    )
+    if result.rowcount == 0:
         return (
             False,
             f"Недостаточно бонусов на балансе ({user.bonus_balance} < {amount}). "
             f"Списывайте не больше текущего баланса.",
         )
+    await session.refresh(user)
 
-    user.bonus_balance -= amount
     await add_bonus_transaction(session, user.id, -amount, reason)
     await session.flush()
 
@@ -1844,7 +1914,16 @@ async def _apply_bonus_grant(
     Начисляет бонусы клиенту и пишет в историю.
     Возвращает False, если уведомление клиенту не доставлено.
     """
-    user.bonus_balance += amount
+    # Атомарное начисление — защита от race condition
+    from sqlalchemy import update as sa_update
+    result = await session.execute(
+        sa_update(User)
+        .where(User.id == user.id)
+        .values(bonus_balance=User.bonus_balance + amount)
+    )
+    if result.rowcount == 0:
+        return False
+    await session.refresh(user)
     await add_bonus_transaction(
         session, user.id, amount, reason, booking_id=booking_id,
     )
@@ -1945,7 +2024,10 @@ async def admin_bonus_revoke_pick(
 ) -> None:
     """Клиент выбран — список его начислений."""
     await callback.answer()
-    tg_id = int(callback.data.removeprefix("bonus_revoke_pick_"))
+    tg_id = parse_callback_int(callback.data, "bonus_revoke_pick_")
+    if tg_id is None:
+        await callback.message.answer("⚠️ Ошибка данных.")
+        return
     result = await session.execute(select(User).where(User.telegram_id == tg_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -1960,7 +2042,10 @@ async def admin_bonus_revoke_tx(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Отменяет выбранное начисление целиком."""
-    tx_id = int(callback.data.removeprefix("bonus_revoke_tx_"))
+    tx_id = parse_callback_int(callback.data, "bonus_revoke_tx_")
+    if tx_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     tx = await _fetch_bonus_transaction(session, tx_id)
     if not tx or tx.amount <= 0:
         await callback.answer("Операция не найдена!", show_alert=True)
@@ -1988,7 +2073,10 @@ async def admin_bonus_revoke_custom(
     callback: CallbackQuery, state: FSMContext,
 ) -> None:
     """Ручной ввод суммы списания бонусов."""
-    tg_id = int(callback.data.removeprefix("bonus_revoke_custom_"))
+    tg_id = parse_callback_int(callback.data, "bonus_revoke_custom_")
+    if tg_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     await state.clear()
     await state.update_data(bonus_revoke_tg_id=tg_id)
     await callback.message.answer(
@@ -2098,7 +2186,10 @@ async def admin_bonus_pick_client(
     """Клиент выбран из списка — показываем суммы."""
     await callback.answer()
     await state.update_data(bonus_booking_id=None)
-    tg_id = int(callback.data.removeprefix("bonus_pick_"))
+    tg_id = parse_callback_int(callback.data, "bonus_pick_")
+    if tg_id is None:
+        await callback.message.answer("⚠️ Ошибка данных.")
+        return
     result = await session.execute(select(User).where(User.telegram_id == tg_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -2114,7 +2205,10 @@ async def admin_bonus_from_booking(
 ) -> None:
     """Начисление бонусов из карточки заявки."""
     await callback.answer()
-    booking_id = int(callback.data.removeprefix("bonus_grant_bk_"))
+    booking_id = parse_callback_int(callback.data, "bonus_grant_bk_")
+    if booking_id is None:
+        await callback.message.answer("⚠️ Ошибка данных.")
+        return
     booking = await _fetch_booking(session, booking_id)
     if not booking:
         await callback.message.answer("⚠️ Заявка не найдена.")
@@ -2131,7 +2225,10 @@ async def admin_bonus_auto_from_visit(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Начисляет рекомендуемые бонусы после завершённого визита."""
-    booking_id = int(callback.data.removeprefix("bonus_auto_"))
+    booking_id = parse_callback_int(callback.data, "bonus_auto_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     booking = await _fetch_booking(session, booking_id)
     if not booking:
         await callback.answer("Заявка не найдена!", show_alert=True)
@@ -2177,7 +2274,10 @@ async def admin_bonus_skip_from_visit(
     callback: CallbackQuery, session: AsyncSession,
 ) -> None:
     """Пропуск начисления бонусов после визита."""
-    booking_id = int(callback.data.removeprefix("bonus_skip_"))
+    booking_id = parse_callback_int(callback.data, "bonus_skip_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     booking = await _fetch_booking(session, booking_id)
     if not booking:
         await callback.answer("Заявка не найдена!", show_alert=True)
@@ -2250,7 +2350,10 @@ async def admin_bonus_add_custom_start(
     callback: CallbackQuery, state: FSMContext,
 ) -> None:
     """Ввод произвольной суммы бонусов."""
-    tg_id = int(callback.data.removeprefix("bonus_add_custom_"))
+    tg_id = parse_callback_int(callback.data, "bonus_add_custom_")
+    if tg_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     await state.clear()
     await state.update_data(bonus_target_tg_id=tg_id)
     await callback.message.answer(

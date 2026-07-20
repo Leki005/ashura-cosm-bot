@@ -27,15 +27,41 @@ from utils.text_format import split_message, wrap_lines
 
 logger = logging.getLogger(__name__)
 
+
+def parse_callback_int(data: str | None, prefix: str) -> Optional[int]:
+    """Извлекает int из callback data после удаления префикса. None при ошибке."""
+    if not data:
+        return None
+    try:
+        return int(data.removeprefix(prefix))
+    except (ValueError, TypeError):
+        return None
+
+
 # Анамнез действителен 7 дней — не спрашиваем повторно
 ANAMNESIS_FRESH_DAYS = 7
 
 # Пресеты процедур при записи (ключ -> название в БД или для отображения)
 PROCEDURE_PRESETS: dict[str, str] = {
-    "consult": "Консультация косметолога",
-    "lips": "Увеличение губ (филлер)",
+    # --- Ботулинотерапия ---
     "botox": "Ботулинотерапия (Ботокс)",
+    "botox_forehead": "Ботокс — лоб",
+    "botox_glabella": "Ботокс — межбровка",
+    "botox_crows": "Ботокс — гусиные лапки",
+    "botox_fullface": "Ботокс — полное лицо",
+    "botox_hyperhidrosis": "Ботокс — гипергидроз (подмышки)",
+    # --- Филлеры ---
+    "lips": "Увеличение губ (филлер)",
     "lipolytics": "Липолитики",
+    # --- Аппаратные процедуры ---
+    "morpheus8": "Morpheus8 (фракционный RF-лифтинг)",
+    "bbl": "BBL (BroadBand Light — фотоомоложение)",
+    # --- Лазер ---
+    "laser_hair_removal": "Лазерная депиляция",
+    "laser_face": "Лазерная депиляция — лицо",
+    "laser_body": "Лазерная депиляция — тело",
+    # --- Другое ---
+    "consult": "Консультация косметолога",
 }
 
 # =============================================================================
@@ -589,11 +615,20 @@ async def grant_confirmation_bonus(
     if amount <= 0:
         return 0
 
-    user = booking.user
-    user.bonus_balance += amount
+    # Атомарное начисление — защита от race condition
+    from sqlalchemy import update as sa_update
+    result = await session.execute(
+        sa_update(User)
+        .where(User.id == booking.user_id)
+        .values(bonus_balance=User.bonus_balance + amount)
+    )
+    if result.rowcount == 0:
+        logger.warning("grant_confirmation_bonus: user %s not found", booking.user_id)
+        return 0
+    await session.refresh(booking.user)
     await add_bonus_transaction(
         session,
-        user.id,
+        booking.user_id,
         amount,
         f"Бонус {Config.BONUS_PERCENT}% при подтверждении записи #{booking.id}",
         booking_id=booking.id,
@@ -601,7 +636,7 @@ async def grant_confirmation_bonus(
     await session.flush()
     logger.info(
         "Подтверждение #%s: +%s бонусов клиенту %s (услуги %s₽)",
-        booking.id, amount, user.id, price,
+        booking.id, amount, booking.user_id, price,
     )
     return amount
 
@@ -655,23 +690,28 @@ async def cancel_booking_by_id(
     session: AsyncSession, booking_id: int, user_id: int,
 ) -> Booking | None:
     """
-    Отменяет запись — явный UPDATE + flush.
+    Отменяет запись — атомарный UPDATE (защита от double-cancel).
     Возвращает обновлённую запись или None если не найдена/не ваша.
     """
+    from sqlalchemy import update as sa_update
     result = await session.execute(
-        select(Booking).where(
+        sa_update(Booking)
+        .where(
             Booking.id == booking_id,
             Booking.user_id == user_id,
             Booking.status.in_(ACTIVE_BOOKING_STATUSES),
         )
+        .values(status=STATUS_CANCELLED)
     )
-    booking = result.scalar_one_or_none()
-    if not booking:
+    if result.rowcount == 0:
         return None
-
-    booking.status = STATUS_CANCELLED
-    await session.flush()
-    logger.info("Запись #%s отменена (user_id=%s)", booking_id, user_id)
+    # Загружаем обновлённую запись
+    booking_result = await session.execute(
+        select(Booking).where(Booking.id == booking_id)
+    )
+    booking = booking_result.scalar_one_or_none()
+    if booking:
+        logger.info("Запись #%s отменена (user_id=%s)", booking_id, user_id)
     return booking
 
 

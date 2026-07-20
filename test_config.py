@@ -66,7 +66,7 @@ class TestConfigDefaults:
         assert Config.BOOKING_MIN_LEAD_MINUTES == 15
 
     def test_cancel_deadline_hours(self):
-        assert Config.CANCEL_DEADLINE_HOURS == 6
+        assert Config.CANCEL_DEADLINE_HOURS == 2
 
     def test_anamnesis_fresh_days(self):
         assert ANAMNESIS_FRESH_DAYS == 7

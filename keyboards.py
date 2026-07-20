@@ -280,22 +280,43 @@ def booking_procedure_keyboard() -> InlineKeyboardMarkup:
     """Выбор процедуры после анамнеза."""
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(
-            text="Консультация косметолога",
-            callback_data="proc_consult",
-        )
+        InlineKeyboardButton(text="Консультация", callback_data="proc_consult"),
+    )
+    # --- Ботулинотерапия ---
+    builder.row(
+        InlineKeyboardButton(text="💉 Ботокс", callback_data="proc_botox"),
     )
     builder.row(
-        InlineKeyboardButton(text="Увеличение губ", callback_data="proc_lips")
+        InlineKeyboardButton(text="Лоб", callback_data="proc_botox_forehead"),
+        InlineKeyboardButton(text="Межбровка", callback_data="proc_botox_glabella"),
     )
     builder.row(
-        InlineKeyboardButton(text="Ботокс", callback_data="proc_botox")
+        InlineKeyboardButton(text="Гусиные лапки", callback_data="proc_botox_crows"),
+        InlineKeyboardButton(text="Фул фейс", callback_data="proc_botox_fullface"),
     )
     builder.row(
-        InlineKeyboardButton(text="Липолитики", callback_data="proc_lipolytics")
+        InlineKeyboardButton(text="Гипергидроз", callback_data="proc_botox_hyperhidrosis"),
+    )
+    # --- Филлеры ---
+    builder.row(
+        InlineKeyboardButton(text="💋 Увеличение губ", callback_data="proc_lips"),
+        InlineKeyboardButton(text="Липолитики", callback_data="proc_lipolytics"),
+    )
+    # --- Аппаратные ---
+    builder.row(
+        InlineKeyboardButton(text="⚡ Morpheus8", callback_data="proc_morpheus8"),
+        InlineKeyboardButton(text="☀️ BBL", callback_data="proc_bbl"),
+    )
+    # --- Лазер ---
+    builder.row(
+        InlineKeyboardButton(text="🔬 Лазерная депиляция", callback_data="proc_laser_hair_removal"),
     )
     builder.row(
-        InlineKeyboardButton(text="✏️ Другое", callback_data="proc_other")
+        InlineKeyboardButton(text="Лицо", callback_data="proc_laser_face"),
+        InlineKeyboardButton(text="Тело", callback_data="proc_laser_body"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="✏️ Другое", callback_data="proc_other"),
     )
     return builder.as_markup()
 
