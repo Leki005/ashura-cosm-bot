@@ -209,10 +209,10 @@ async def test_no_refund_when_bonus_used_is_zero(db_session):
 
 async def test_revoke_confirmation_bonus_on_admin_reject(db_session):
     """
-    When admin rejects a confirmed booking, the 5% confirmation bonus is revoked.
+    When admin rejects a confirmed booking, the 3% confirmation bonus is revoked.
     Uses func.max(0, ...) to prevent negative balance.
     """
-    user = _make_user(bonus_balance=175)  # 175 = 5% of 3500
+    user = _make_user(bonus_balance=105)  # 105 = 3% of 3500
     db_session.add(user)
     svc = _seed_service(db_session, price=3500)
     await db_session.flush()
@@ -228,15 +228,15 @@ async def test_revoke_confirmation_bonus_on_admin_reject(db_session):
     # Simulate confirmation bonus transaction
     from utils.helpers import add_bonus_transaction
     await add_bonus_transaction(
-        db_session, user.id, 175,
-        f"Бонус 5% при подтверждении записи #{booking.id}",
+        db_session, user.id, 105,
+        f"Бонус 3% при подтверждении записи #{booking.id}",
         booking_id=booking.id,
     )
     await db_session.refresh(user)
-    assert user.bonus_balance == 175
+    assert user.bonus_balance == 105
 
     # Admin rejects → revoke confirmation bonus
-    confirmation_tx_amount = 175
+    confirmation_tx_amount = 105
     await db_session.execute(
         sa_update(User)
         .where(User.id == user.id)
@@ -246,7 +246,7 @@ async def test_revoke_confirmation_bonus_on_admin_reject(db_session):
     assert user.bonus_balance == 0
 
     await add_bonus_transaction(
-        db_session, user.id, -175,
+        db_session, user.id, -105,
         f"Отзыв бонуса при отмене записи #{booking.id}",
         booking_id=booking.id,
     )
@@ -259,7 +259,7 @@ async def test_revoke_confirmation_bonus_on_admin_reject(db_session):
         )
     )
     tx = result.scalar_one()
-    assert tx.amount == -175
+    assert tx.amount == -105
     assert "Отзыв" in tx.description
 
 
@@ -268,11 +268,11 @@ async def test_revoke_confirmation_bonus_partial_when_low_balance(db_session):
     If user spent some bonuses between confirmation and rejection,
     func.max(0, ...) prevents negative balance.
     """
-    user = _make_user(bonus_balance=50)  # only 50 left (spent 125 of 175)
+    user = _make_user(bonus_balance=50)  # only 50 left (spent 55 of 105)
     db_session.add(user)
     await db_session.flush()
 
-    confirmation_tx_amount = 175  # original was 175, but user only has 50
+    confirmation_tx_amount = 105  # original was 105, but user only has 50
 
     await db_session.execute(
         sa_update(User)
@@ -318,24 +318,24 @@ async def test_revoke_refund_bonus_on_admin_reject_with_bonus_used(db_session):
         booking_id=booking.id,
     )
 
-    # Step 2: Revoke confirmation bonus (175)
+    # Step 2: Revoke confirmation bonus (105)
     await add_bonus_transaction(
-        db_session, user.id, 175,
-        f"Бонус 5% при подтверждении записи #{booking.id}",
+        db_session, user.id, 105,
+        f"Бонус 3% при подтверждении записи #{booking.id}",
         booking_id=booking.id,
     )
     await db_session.refresh(user)
-    user.bonus_balance += 175  # simulate confirmation bonus was granted
+    user.bonus_balance += 105  # simulate confirmation bonus was granted
     await db_session.flush()
 
     # Now revoke
     await db_session.execute(
         sa_update(User)
         .where(User.id == user.id)
-        .values(bonus_balance=func.max(0, User.bonus_balance - 175))
+        .values(bonus_balance=func.max(0, User.bonus_balance - 105))
     )
     await db_session.refresh(user)
-    assert user.bonus_balance == 700, "After revoke: 500 + 200 refund + 175 grant - 175 revoke = 700"
+    assert user.bonus_balance == 700, "After revoke: 500 + 200 refund + 105 grant - 105 revoke = 700"
 
 
 # ---------------------------------------------------------------------------

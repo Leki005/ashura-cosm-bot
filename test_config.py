@@ -57,7 +57,7 @@ class TestConfigValidate:
 
 class TestConfigDefaults:
     def test_bonus_percent(self):
-        assert Config.BONUS_PERCENT == 5
+        assert Config.BONUS_PERCENT == 3
 
     def test_bonus_max_discount_percent(self):
         assert Config.BONUS_MAX_DISCOUNT_PERCENT == 50

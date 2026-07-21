@@ -477,6 +477,18 @@ def admin_booking_confirmed_keyboard(booking_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def admin_booking_completed_keyboard(booking_id: int) -> InlineKeyboardMarkup:
+    """Кнопки для завершённой заявки (отзыв бонусов)."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="↩️ Отозвать бонус", callback_data=f"admin_revoke_bonus_bk_{booking_id}"),
+    )
+    builder.row(
+        admin_contact_client_button(booking_id=booking_id),
+    )
+    return builder.as_markup()
+
+
 def admin_bonuses_menu_keyboard() -> InlineKeyboardMarkup:
     """Меню управления бонусами."""
     builder = InlineKeyboardBuilder()

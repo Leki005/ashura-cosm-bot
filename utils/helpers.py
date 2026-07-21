@@ -578,7 +578,7 @@ def calculate_booking_price(booking: Booking) -> int:
 
 
 def confirmation_bonus_amount(price: int) -> int:
-    """5% бонусов (скидка) при подтверждении записи."""
+    """3% бонусов (скидка) при подтверждении записи."""
     if price <= 0:
         return 0
     return price * Config.BONUS_PERCENT // 100
@@ -604,7 +604,7 @@ async def grant_confirmation_bonus(
     session: AsyncSession, booking: Booking,
 ) -> int:
     """
-    Начисляет 5% бонусов клиентке при подтверждении записи.
+    Начисляет 3% бонусов клиентке при подтверждении записи.
     Возвращает сумму начисления или 0.
     """
     if await _booking_has_confirmation_bonus(session, booking.id):

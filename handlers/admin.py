@@ -42,6 +42,7 @@ from keyboards import (
     admin_bonus_revoke_tx_keyboard,
     admin_bonuses_menu_keyboard,
     admin_visit_bonus_keyboard,
+    admin_booking_completed_keyboard,
     admin_booking_confirmed_keyboard,
     admin_booking_keyboard,
     admin_bookings_filter_keyboard,
@@ -254,7 +255,7 @@ async def _confirm_booking(
     admin_id: int,
 ) -> tuple[bool, int]:
     """
-    Переводит заявку в confirmed, начисляет 5% бонусов и уведомляет клиента.
+    Переводит заявку в confirmed, начисляет 3% бонусов и уведомляет клиента.
     Возвращает (доставлено_уведомление, сумма_бонусов).
     """
     from utils.helpers import now_salon
@@ -423,6 +424,8 @@ async def admin_bookings_list(
             markup = admin_booking_keyboard(b.id)
         elif status == STATUS_CONFIRMED:
             markup = admin_booking_confirmed_keyboard(b.id)
+        elif status == STATUS_COMPLETED:
+            markup = admin_booking_completed_keyboard(b.id)
         else:
             markup = None
 
@@ -734,8 +737,8 @@ async def process_reject_reason(
         await state.clear()
         return
 
-    # Только pending/confirmed можно отклонить
-    if booking.status not in (STATUS_PENDING, STATUS_CONFIRMED):
+    # Только pending/confirmed/completed можно отклонить
+    if booking.status not in (STATUS_PENDING, STATUS_CONFIRMED, STATUS_COMPLETED):
         await msg.answer(f"⚠️ Заявка #{booking_id} уже в статусе: {booking.status}. Нельзя отклонить.")
         await state.clear()
         return
@@ -746,7 +749,7 @@ async def process_reject_reason(
     from sqlalchemy import update as sa_update
     result = await session.execute(
         sa_update(Booking)
-        .where(Booking.id == booking.id, Booking.status.in_((STATUS_PENDING, STATUS_CONFIRMED)))
+        .where(Booking.id == booking.id, Booking.status.in_((STATUS_PENDING, STATUS_CONFIRMED, STATUS_COMPLETED)))
         .values(status=STATUS_CANCELLED)
     )
     if result.rowcount == 0:
@@ -781,7 +784,7 @@ async def process_reject_reason(
             booking_id=booking_id,
         )
 
-    # Отзыв бонуса, начисленного при подтверждении (+5%) — атомарно
+    # Отзыв бонуса, начисленного при подтверждении (+3%) — атомарно
     confirmation_tx = await session.execute(
         select(BonusTransaction).where(
             BonusTransaction.booking_id == booking_id,
@@ -806,6 +809,33 @@ async def process_reject_reason(
             f"Отзыв бонуса при отмене записи #{booking_id}",
             booking_id=booking_id,
         )
+
+    # Отзыв бонуса за визит (начисление при завершении) — атомарно
+    visit_tx = await session.execute(
+        select(BonusTransaction).where(
+            BonusTransaction.booking_id == booking_id,
+            BonusTransaction.amount > 0,
+            BonusTransaction.description.contains("за выполненную запись"),
+        )
+    )
+    visit_tx_row = visit_tx.scalar_one_or_none()
+    if visit_tx_row and visit_tx_row.amount > 0:
+        visit_bonus_revoked = visit_tx_row.amount
+        from sqlalchemy import update as sa_update
+        await session.execute(
+            sa_update(User)
+            .where(User.id == user.id)
+            .values(bonus_balance=func.max(0, User.bonus_balance - visit_bonus_revoked))
+        )
+        await session.refresh(user)
+        await add_bonus_transaction(
+            session,
+            user.id,
+            -visit_bonus_revoked,
+            f"Отзыв бонуса визита при отмене записи #{booking_id}",
+            booking_id=booking_id,
+        )
+        bonus_revoked += visit_bonus_revoked
 
     await session.flush()
 
@@ -2035,6 +2065,49 @@ async def admin_bonus_revoke_pick(
         return
 
     await _prompt_bonus_revoke_list(callback.message, session, user)
+
+
+@router.callback_query(F.data.regexp(r"^admin_revoke_bonus_bk_(\d+)$"))
+async def admin_revoke_bonus_from_booking(
+    callback: CallbackQuery, session: AsyncSession,
+) -> None:
+    """Отзывает бонус подтверждения для завершённой записи."""
+    booking_id = parse_callback_int(callback.data, "admin_revoke_bonus_bk_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    # Find confirmation bonus transaction for this booking
+    result = await session.execute(
+        select(BonusTransaction)
+        .options(joinedload(BonusTransaction.user))
+        .where(
+            BonusTransaction.booking_id == booking_id,
+            BonusTransaction.amount > 0,
+            BonusTransaction.description.contains("при подтверждении"),
+        )
+    )
+    tx = result.scalar_one_or_none()
+
+    if not tx:
+        await callback.answer("Бонус подтверждения не найден.", show_alert=True)
+        return
+
+    if await _bonus_tx_already_revoked(session, tx.id):
+        await callback.answer("Этот бонус уже отозван.", show_alert=True)
+        return
+
+    user = tx.user
+    _, admin_line = await _apply_bonus_revoke(
+        session,
+        callback.bot,
+        user,
+        tx.amount,
+        reason=f"Отзыв бонуса записи #{booking_id}: {tx.description}",
+        admin_id=callback.from_user.id,
+    )
+    await callback.answer("Бонус отозван")
+    await callback.message.answer(admin_line, parse_mode="HTML")
 
 
 @router.callback_query(F.data.regexp(r"^bonus_revoke_tx_(\d+)$"))

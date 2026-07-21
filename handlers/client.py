@@ -2381,7 +2381,7 @@ async def cancel_booking_confirm(
         )
         booking.bonus_used = 0
 
-    # Отзываем бонус подтверждения (+5%), если был
+    # Отзываем бонус подтверждения (+3%), если был
     from sqlalchemy import select as sa_select
     from database import BonusTransaction
     conf_tx_result = await session.execute(

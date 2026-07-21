@@ -52,7 +52,7 @@ class Config:
     INSTAGRAM_LINK: str = "https://www.instagram.com/ashuracosm"
 
     # --- Бонусная система ---
-    BONUS_PERCENT: int = 5           # Процент бонусов
+    BONUS_PERCENT: int = 3           # Процент бонусов
     BONUS_MIN_AMOUNT: int = 20000    # Минимальная сумма для начисления
     BONUS_MAX_DISCOUNT_PERCENT: int = 50  # Максимальная скидка бонусами (%)
 
