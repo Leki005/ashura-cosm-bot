@@ -104,7 +104,7 @@ class AdminOnlyMiddleware:
                 try:
                     await event.answer('⛔ Нет доступа!', show_alert=True)
                 except Exception:
-                    pass
+                    logger.debug("AdminOnlyMiddleware: answer failed", exc_info=True)
             return None
         
         return await handler(event, data)
@@ -273,7 +273,9 @@ async def _confirm_booking(
     fresh = await session.execute(
         select(Booking).options(joinedload(Booking.user)).where(Booking.id == booking.id)
     )
-    booking = fresh.scalar_one()
+    booking = fresh.scalar_one_or_none()
+    if not booking:
+        return False, "Заявка не найдена."
 
     bonus_granted = await grant_confirmation_bonus(session, booking)
 
@@ -575,8 +577,6 @@ async def admin_accept_booking(
     """Начинает принятие заявки — быстро на дату клиента или ввод вручную."""
     # Защита от коллизии: пропускаем если callback длиннее (quick_, custom_, force_accept_)
     data = callback.data
-    if data.startswith(("admin_accept_quick_", "admin_accept_custom_", "admin_force_accept_")):
-        return
 
     booking_id = int(data.removeprefix("admin_accept_"))
     booking = await _fetch_booking(session, booking_id)
@@ -1668,7 +1668,7 @@ async def admin_faq_add_answer(
 
     await msg.answer(
         f"✅ Вопрос добавлен в FAQ (#{faq.id}).\n\n"
-        f"<b>{question}</b>\n{answer}",
+        f"<b>{html_escape(question)}</b>\n{html_escape(answer)}",
         parse_mode="HTML",
     )
     await state.clear()

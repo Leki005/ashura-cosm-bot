@@ -23,6 +23,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -1843,7 +1844,7 @@ async def review_edit_start(callback: CallbackQuery, state: FSMContext, session:
     await callback.message.answer(
         f"✏️ <b>Редактирование отзыва</b>\n\n"
         f"Текущая оценка: {'★' * review.rating}\n"
-        f"Текст: {review.text or '—'}\n\n"
+        f"Текст: {html_escape(review.text or '—')}\n\n"
         f"Выберите новую оценку:",
         reply_markup=builder.as_markup(),
         parse_mode="HTML",

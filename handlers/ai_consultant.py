@@ -126,13 +126,13 @@ async def _enter_ai_mode(message: Message, state: FSMContext) -> None:
     await message.answer(AI_WELCOME, reply_markup=ai_consultant_keyboard())
 
 
-async def _exit_ai_mode(message: Message, state: FSMContext) -> None:
+async def _exit_ai_mode(message: Message, state: FSMContext, user_id: int | None = None) -> None:
     """Выход из AI-режима в главное меню."""
     data = await state.get_data()
     # Сбрасываем счётчик фото
     from_user = message.from_user
     if from_user:
-        reset_photo_session(from_user.id)
+        reset_photo_session(user_id if user_id else from_user.id)
     await state.clear()
     await show_client_home(
         message,
@@ -169,7 +169,7 @@ async def start_ai_consultant(
 async def exit_ai_consultant(callback: CallbackQuery, state: FSMContext) -> None:
     """Выход по кнопке «Завершить общение»."""
     try:
-        await _exit_ai_mode(callback.message, state)
+        await _exit_ai_mode(callback.message, state, user_id=callback.from_user.id)
     except Exception as e:
         logger.error("Ошибка выхода из AI: %s", e)
         await show_client_home(callback.message, "👋 Вы в главном меню!")
