@@ -17,7 +17,7 @@ from datetime import datetime
 from html import escape as html_escape
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -3179,22 +3179,21 @@ _admin_grok_history: dict[int, list[dict]] = {}
 _ADMIN_GROK_MAX_HISTORY = 50
 
 
-@router.message(F.text, ~F.text.startswith("/"))
+# ВАЖНО (баг «Помощник ИИ» → «Нет доступа!» / молчание):
+# 1) Только ADMIN_ID — иначе клиентский текст матчится сюда → AdminOnlyMiddleware → «⛔ Нет доступа!»
+# 2) StateFilter(None) — только когда НЕТ FSM. В режиме ИИ (AIConsultantState) хендлер
+#    вообще не матчится → сообщение идёт в ai_consultant (без SkipHandler).
+# 3) В bot.py ai_consultant.router должен быть ПЕРЕД admin.router.
+@router.message(
+    StateFilter(None),
+    F.from_user.id == Config.ADMIN_ID,
+    F.text,
+    ~F.text.startswith("/"),
+)
 async def admin_auto_grok(message: Message, state: FSMContext) -> None:
     """
-    Автоматический ответ Grok на ЛЮБОЕ текстовое сообщение админа.
-    Срабатывает только когда админ НЕ в каком-то FSM-состоянии.
-    Админ не нажимает никаких кнопок — просто пишет, Grok отвечает.
+    Свободный Grok-чат для админа: только без активного FSM-состояния.
     """
-    # Только ADMIN_ID
-    if message.from_user.id != Config.ADMIN_ID:
-        return
-
-    # Если админ в каком-то FSM-состоянии — не перехватываем
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
-
     admin_id = message.from_user.id
     if admin_id not in _admin_grok_history:
         _admin_grok_history[admin_id] = []
@@ -3202,7 +3201,6 @@ async def admin_auto_grok(message: Message, state: FSMContext) -> None:
     history = _admin_grok_history[admin_id]
     history.append({"role": "user", "content": message.text})
 
-    # Ограничиваем историю
     if len(history) > _ADMIN_GROK_MAX_HISTORY:
         _admin_grok_history[admin_id] = history[-_ADMIN_GROK_MAX_HISTORY:]
         history = _admin_grok_history[admin_id]
@@ -3223,16 +3221,13 @@ async def admin_auto_grok(message: Message, state: FSMContext) -> None:
         await message.answer(f"❌ Grok недоступен: {e}")
 
 
-@router.message(F.photo)
+@router.message(
+    StateFilter(None),
+    F.from_user.id == Config.ADMIN_ID,
+    F.photo,
+)
 async def admin_auto_grok_photo(message: Message, state: FSMContext) -> None:
-    """Автоматический анализ фото от админа через Grok Vision."""
-    if message.from_user.id != Config.ADMIN_ID:
-        return
-
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
-
+    """Анализ фото админа через Grok Vision — только вне FSM."""
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:

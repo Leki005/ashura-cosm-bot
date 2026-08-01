@@ -1032,11 +1032,10 @@ async def main() -> None:
     dp.update.middleware(DbSessionMiddleware())
     dp.update.middleware(PrivacyConsentMiddleware())
 
-    # Админ-роутер первым — чтобы client-хендлеры (svc_ и т.д.) не перехватывали admin_*
     dp.include_router(common.router)
     dp.include_router(privacy.router)
+    dp.include_router(ai_consultant.router)  # AI ПЕРЕД admin — чтобы admin_auto_grok не перехватывал AI-сообщения
     dp.include_router(admin.router)
-    dp.include_router(ai_consultant.router)
     dp.include_router(skin_anamnesis.router)
     dp.include_router(client.router)
 
