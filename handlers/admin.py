@@ -722,6 +722,11 @@ async def process_accept_datetime(
         await msg.answer(f"⚠️ {err}")
         return
 
+    # Сохраняем оригинальную дату до изменения
+    original_date = booking.preferred_date
+    original_time = booking.preferred_time
+    date_changed = (date_part != original_date) or (time_part != original_time)
+
     booking.preferred_date = date_part
     booking.preferred_time = time_part
 
@@ -771,6 +776,33 @@ async def process_accept_datetime(
         if notified
         else "⚠️ Уведомление клиенту не доставлено — свяжитесь вручную.\n"
     )
+
+    # Если дата изменена — отправляем клиенту отдельное уведомление
+    if date_changed and notified:
+        try:
+            old_when = f"{original_date}" + (f" {original_time}" if original_time else "")
+            new_when = f"{date_part}" + (f" {time_part}" if time_part else "")
+            change_builder = InlineKeyboardBuilder()
+            change_builder.row(
+                InlineKeyboardButton(text="✅ Подтвердить новую дату", callback_data=f"client_confirm_reschedule_{booking_id}"),
+            )
+            change_builder.row(
+                InlineKeyboardButton(text="📞 Связаться с Ашурой", url=f"tg://user?id={Config.ADMIN_ID}"),
+            )
+            await msg.bot.send_message(
+                chat_id=booking.user.telegram_id,
+                text=(
+                    f"📅 <b>Внимание — дата записи изменена!</b>\n\n"
+                    f"💅 {format_booking_services_line(booking)}\n"
+                    f"❌ Было: <b>{old_when}</b>\n"
+                    f"✅ Стало: <b>{new_when}</b>\n\n"
+                    f"Если новое время не подходит — свяжитесь с Ашурой напрямую."
+                ),
+                reply_markup=change_builder.as_markup(),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить уведомление об изменении даты: %s", e)
 
     await msg.answer(
         f"✅ <b>Заявка #{booking_id} принята!</b>\n\n"

@@ -3032,6 +3032,28 @@ async def cancel_booking_abort(callback: CallbackQuery) -> None:
     await callback.answer("Запись не изменена.")
 
 
+@router.callback_query(F.data.startswith("client_confirm_reschedule_"))
+async def client_confirm_reschedule(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Клиент подтвердил новую дату после переноса админом."""
+    booking_id = parse_callback_int(callback.data, "client_confirm_reschedule_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    # Убираем кнопки
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        "✅ <b>Новая дата подтверждена!</b>\n\n"
+        "Ждём вас в назначенное время 💫",
+        parse_mode="HTML",
+    )
+    await callback.answer("✅ Подтверждено!")
+
+
 # =============================================================================
 # ОТМЕНА FSM — хендлер (новое!)
 # =============================================================================
