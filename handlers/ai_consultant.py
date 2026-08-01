@@ -199,8 +199,9 @@ async def ai_consultant_message(message: Message, state: FSMContext) -> None:
     except GrokAPIError as e:
         logger.warning("Grok error for user %s: %s", message.from_user.id, e)
         await message.answer(
-            AI_UNAVAILABLE,
+            f"{AI_UNAVAILABLE}\n\n<i>Причина: {html_escape(str(e))}</i>",
             reply_markup=ai_consultant_keyboard(),
+            parse_mode="HTML",
         )
         return
 

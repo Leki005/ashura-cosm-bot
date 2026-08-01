@@ -76,7 +76,7 @@ _audit_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
 logging.getLogger('audit').addHandler(_audit_handler)
 
 # Отключаем шумные логи
-logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+logging.getLogger("aiogram.event").setLevel(logging.INFO)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 # =============================================================================
