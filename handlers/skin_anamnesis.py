@@ -1432,6 +1432,15 @@ async def _save_and_notify(message: Message, state: FSMContext, answers: dict, s
             for chunk in split_message(rec_msg):
                 await message.bot.send_message(chat_id=Config.ADMIN_ID, text=chunk, parse_mode="HTML")
             logger.info("skin_anamnesis: рекомендации отправлены Ашуре")
+
+            # Сохраняем рекомендации в историю Grok админа (чтобы помнил)
+            from handlers.admin import _append_admin_context
+            client_summary = f"Клиент: {user.name}, возраст: {answers.get('age', '?')}, тип кожи: {answers.get('skin_type', '?')}"
+            await _append_admin_context(
+                Config.ADMIN_ID, "user",
+                f"[Анамнез кожи] {client_summary}\nПроблемы: {', '.join(answers.get('problems', []))}\nЦели: {', '.join(answers.get('goals', []))}"
+            )
+            await _append_admin_context(Config.ADMIN_ID, "assistant", admin_recs)
         else:
             logger.warning("skin_anamnesis: рекомендации пустые (Grok не ответил)")
     except Exception as e:

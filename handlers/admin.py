@@ -3173,10 +3173,44 @@ async def sheets_sync_now(callback: CallbackQuery, session: AsyncSession) -> Non
 # GROK ДЛЯ АДМИНА — автоматический ответ на любое сообщение
 # =============================================================================
 
-# Хранилище истории диалогов админа с Grok (in-memory, до рестарта)
-# Dict keyed by admin_id to prevent cross-admin contamination
-_admin_grok_history: dict[int, list[dict]] = {}
-_ADMIN_GROK_MAX_HISTORY = 50
+# Хранилище истории диалогов админа с Grok (Redis-backed, персистентно)
+_ADMIN_GROK_MAX_HISTORY = 200
+_ADMIN_GROK_REDIS_PREFIX = "admin_grok_history"
+
+
+async def _load_admin_history(admin_id: int) -> list[dict]:
+    """Загружает историю Grok админа из Redis."""
+    try:
+        from bot import _redis_client
+        if _redis_client:
+            import json
+            key = f"{_ADMIN_GROK_REDIS_PREFIX}:{admin_id}"
+            data = await _redis_client.get(key)
+            if data:
+                return json.loads(data)
+    except Exception:
+        pass
+    return []
+
+
+async def _save_admin_history(admin_id: int, history: list[dict]) -> None:
+    """Сохраняет историю Grok админа в Redis (TTL 30 дней)."""
+    try:
+        from bot import _redis_client
+        if _redis_client:
+            import json
+            key = f"{_ADMIN_GROK_REDIS_PREFIX}:{admin_id}"
+            trimmed = history[-_ADMIN_GROK_MAX_HISTORY:]
+            await _redis_client.set(key, json.dumps(trimmed, ensure_ascii=False), ex=2592000)
+    except Exception:
+        pass
+
+
+async def _append_admin_context(admin_id: int, role: str, content: str) -> None:
+    """Добавляет сообщение в историю Grok админа (для рекомендаций по клиентам)."""
+    history = await _load_admin_history(admin_id)
+    history.append({"role": role, "content": content})
+    await _save_admin_history(admin_id, history)
 
 
 # ВАЖНО (баг «Помощник ИИ» → «Нет доступа!» / молчание):
@@ -3195,15 +3229,8 @@ async def admin_auto_grok(message: Message, state: FSMContext) -> None:
     Свободный Grok-чат для админа: только без активного FSM-состояния.
     """
     admin_id = message.from_user.id
-    if admin_id not in _admin_grok_history:
-        _admin_grok_history[admin_id] = []
-
-    history = _admin_grok_history[admin_id]
+    history = await _load_admin_history(admin_id)
     history.append({"role": "user", "content": message.text})
-
-    if len(history) > _ADMIN_GROK_MAX_HISTORY:
-        _admin_grok_history[admin_id] = history[-_ADMIN_GROK_MAX_HISTORY:]
-        history = _admin_grok_history[admin_id]
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
@@ -3211,6 +3238,7 @@ async def admin_auto_grok(message: Message, state: FSMContext) -> None:
         from utils.grok import ask_grok_admin
         response = await ask_grok_admin(history)
         history.append({"role": "assistant", "content": response})
+        await _save_admin_history(admin_id, history)
 
         from utils.text_format import split_message
         for part in split_message(response, max_len=4000):
