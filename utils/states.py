@@ -25,7 +25,6 @@ class AnamnesisState(StatesGroup):
 
 class BookingState(StatesGroup):
     """Состояния создания заявки на запись."""
-    waiting_anamnesis = State()     # Ожидание анамнеза
     waiting_procedure = State()     # Выбор процедуры из списка
     waiting_procedure_custom = State()  # «Другое» — ввод вручную
     waiting_date = State()          # Ожидание желаемой даты
@@ -35,7 +34,6 @@ class BookingState(StatesGroup):
     waiting_merge_procedure = State()  # Выбор процедуры для объединения с записью
     waiting_merge_custom = State()  # «Другое» при объединении — ввод вручную
     waiting_bonus_amount = State()  # Ожидание выбора количества бонусов
-    confirm = State()               # Подтверждение заявки
 
 
 class ReviewState(StatesGroup):
@@ -102,9 +100,16 @@ class AdminBonusRevokeState(StatesGroup):
     waiting_amount = State()    # Ручное списание суммы
 
 
+class AdminCRMState(StatesGroup):
+    """CRM: поиск клиента и редактирование карточки."""
+    waiting_search = State()        # Ввод поискового запроса (телефон/имя)
+    waiting_next_visit = State()    # Ввод даты следующего визита
+
+
 class PostProcedureState(StatesGroup):
     """Ответ клиента на опрос после процедуры."""
     waiting_feedback = State()
+    waiting_question = State()  # Вопрос после процедуры (AI отвечает)
 
 
 class AIConsultantState(StatesGroup):

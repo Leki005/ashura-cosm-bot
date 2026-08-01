@@ -44,7 +44,11 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
 
 def get_ssl_verify() -> bool:
     """PROXY_SSL_VERIFY=false отключает проверку сертификатов (нужно для Reality/Happ)."""
-    return _parse_bool(os.getenv("PROXY_SSL_VERIFY", "false"), default=False)
+    val = _parse_bool(os.getenv("PROXY_SSL_VERIFY", "true"), default=True)
+    if not val:
+        logger.warning("SSL verification DISABLED (PROXY_SSL_VERIFY=false). "
+                        "Это уязвимо к MITM-атакам. Включите если прокси не Reality.")
+    return val
 
 
 def build_ssl_context(verify: bool) -> ssl.SSLContext:

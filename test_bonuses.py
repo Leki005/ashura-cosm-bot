@@ -456,6 +456,15 @@ async def test_confirmation_bonus_not_granted_twice(db_session):
     svc = _seed_service(db_session, price=3500)
     await db_session.flush()
 
+    # Seed 1 completed visit so loyalty tier = 3%
+    completed_booking = Booking(
+        user_id=user.id, service_id=svc.id,
+        status="completed",
+        preferred_date="10.07.2026", preferred_time="10:00",
+    )
+    db_session.add(completed_booking)
+    await db_session.flush()
+
     booking = Booking(
         user_id=user.id, service_id=svc.id,
         status="confirmed",
@@ -467,10 +476,10 @@ async def test_confirmation_bonus_not_granted_twice(db_session):
     # Load the service relationship so calculate_booking_price can read it
     await db_session.refresh(booking, ["service"])
 
-    # First grant
+    # First grant — should succeed (1 completed visit → 3% loyalty)
     from utils.helpers import grant_confirmation_bonus
     amount1 = await grant_confirmation_bonus(db_session, booking)
-    assert amount1 > 0, "First grant should succeed"
+    assert amount1 > 0, "First grant should succeed (loyalty 3%)"
 
     # Second grant — must return 0 (already granted)
     await db_session.refresh(booking)

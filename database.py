@@ -37,7 +37,10 @@ from sqlalchemy import event, text as sql_text
 def _set_sqlite_pragma(dbapi_conn, _):
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.execute("PRAGMA cache_size=-64000")      # 64MB кеш
+    cursor.execute("PRAGMA mmap_size=268435456")     # 256MB memory-map
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
@@ -72,6 +75,22 @@ class User(Base):
     pd_consent_version: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(SALON_TZ).replace(tzinfo=None))
 
+    # CRM: рекомендуемый следующий визит
+    next_visit_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    next_visit_manual: Mapped[bool] = mapped_column(Boolean, default=False)  # True = ручная установка, не пересчитывать
+    # CRM: идемпотентность напоминаний (за какую next_visit_at уже отправлено)
+    revisit_reminder_sent_for: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # CRM: идемпотентность churn-алертов владельцу
+    churn_alert_30_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    churn_alert_60_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    # CRM: клиент отключил напоминания
+    revisit_reminder_disabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # CRM: счётчик неотвеченных напоминаний (авто-отключение после 2)
+    revisit_reminder_no_response: Mapped[int] = mapped_column(Integer, default=0)
+    # Google Sheets sync
+    sheets_dirty: Mapped[bool] = mapped_column(Boolean, default=False)
+    sheets_last_synced: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Связи
     bookings: Mapped[list["Booking"]] = relationship("Booking", back_populates="user")
     reviews: Mapped[list["Review"]] = relationship("Review", back_populates="user")
@@ -85,7 +104,7 @@ class PersonalDataConsentLog(Base):
     __tablename__ = "pd_consent_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     policy_version: Mapped[str] = mapped_column(String(20), nullable=False)
     consented_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(SALON_TZ).replace(tzinfo=None))
@@ -104,6 +123,8 @@ class Service(Base):
     price: Mapped[int] = mapped_column(Integer, nullable=False)
     duration: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # CRM: рекомендуемый интервал повторного визита (дни)
+    revisit_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 class Booking(Base):
@@ -112,15 +133,15 @@ class Booking(Base):
     __table_args__ = (
         CheckConstraint("bonus_used >= 0", name="ck_booking_bonus_used_nonneg"),
         CheckConstraint(
-            "status IN ('pending', 'confirmed', 'completed', 'cancelled')",
+            "status IN ('pending', 'confirmed', 'completed', 'cancelled', 'expired')",
             name="ck_booking_status_valid",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     service_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("services.id"), nullable=True
+        ForeignKey("services.id", ondelete="SET NULL"), nullable=True
     )
     preferred_date: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     preferred_time: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -147,6 +168,26 @@ class Booking(Base):
     service: Mapped[Optional["Service"]] = relationship("Service")
 
 
+class WaitingList(Base):
+    """Лист ожидания — клиент ждёт свободный слот на дату."""
+    __tablename__ = "waiting_list"
+    __table_args__ = (
+        CheckConstraint("status IN ('waiting', 'notified', 'booked', 'expired')",
+                        name="ck_waiting_list_status_valid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    service_id: Mapped[Optional[int]] = mapped_column(ForeignKey("services.id", ondelete="SET NULL"), nullable=True)
+    preferred_date: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="waiting")
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(SALON_TZ).replace(tzinfo=None))
+
+    user: Mapped["User"] = relationship("User")
+    service: Mapped[Optional["Service"]] = relationship("Service")
+
+
 class Review(Base):
     """Отзыв клиента."""
     __tablename__ = "reviews"
@@ -155,7 +196,7 @@ class Review(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     rating: Mapped[int] = mapped_column(Integer, nullable=False)  # 1-5
     text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_published: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -181,11 +222,20 @@ class BonusTransaction(Base):
     """История операций с бонусами (защита от накрутки)."""
     __tablename__ = "bonus_transactions"
 
+    # Типы транзакций
+    TX_CONFIRM_BONUS = "CONFIRM_BONUS"   # Бонус за лояльность при подтверждении
+    TX_VISIT_BONUS = "VISIT_BONUS"       # Бонус за завершённый визит
+    TX_SPEND = "SPEND"                   # Списание при записи
+    TX_REFUND = "REFUND"                 # Возврат при отмене
+    TX_REVOKE = "REVOKE"                 # Отзыв начисления
+    TX_MANUAL = "MANUAL"                 # Ручная корректировка админом
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     amount: Mapped[int] = mapped_column(Integer, nullable=False)  # + начисление, - списание
+    tx_type: Mapped[str] = mapped_column(String(20), nullable=False, default="MANUAL")
     booking_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("bookings.id"), nullable=True
+        ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True
     )
     description: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(SALON_TZ).replace(tzinfo=None))
@@ -435,7 +485,13 @@ async def apply_migrations(session: AsyncSession) -> None:
 
     async def _safe_add_column(table: str, column: str, ddl: str) -> None:
         """Безопасно добавляет колонку — игнорирует если уже существует."""
-        cols_result = await session.execute(text(f"PRAGMA table_info({table})"))
+        # Whitelist таблиц — защита от SQL injection через PRAGMA
+        _ALLOWED_TABLES = frozenset({"users", "bookings", "services", "reviews",
+                                     "faq", "bonus_transactions", "admin_settings",
+                                     "pd_consent_logs"})
+        if table not in _ALLOWED_TABLES:
+            raise ValueError(f"Table '{table}' not in whitelist")
+        cols_result = await session.execute(text(f'PRAGMA table_info("{table}")'))
         existing = {row[1] for row in cols_result.all()}
         if column not in existing:
             await session.execute(text(ddl))
@@ -495,6 +551,57 @@ async def apply_migrations(session: AsyncSession) -> None:
     await _safe_add_column("reviews", "notified_admin",
                            "ALTER TABLE reviews ADD COLUMN notified_admin BOOLEAN DEFAULT 0")
 
+    # CRM миграции (ДО любых SELECT из services/users)
+    await _safe_add_column("services", "revisit_days",
+                           "ALTER TABLE services ADD COLUMN revisit_days INTEGER")
+    await _safe_add_column("users", "next_visit_at",
+                           "ALTER TABLE users ADD COLUMN next_visit_at DATETIME")
+    await _safe_add_column("users", "next_visit_manual",
+                           "ALTER TABLE users ADD COLUMN next_visit_manual BOOLEAN DEFAULT 0")
+    await _safe_add_column("users", "revisit_reminder_sent_for",
+                           "ALTER TABLE users ADD COLUMN revisit_reminder_sent_for DATETIME")
+    await _safe_add_column("users", "churn_alert_30_sent",
+                           "ALTER TABLE users ADD COLUMN churn_alert_30_sent BOOLEAN DEFAULT 0")
+    await _safe_add_column("users", "churn_alert_60_sent",
+                           "ALTER TABLE users ADD COLUMN churn_alert_60_sent BOOLEAN DEFAULT 0")
+    await _safe_add_column("users", "revisit_reminder_disabled",
+                           "ALTER TABLE users ADD COLUMN revisit_reminder_disabled BOOLEAN DEFAULT 0")
+    await _safe_add_column("users", "revisit_reminder_no_response",
+                           "ALTER TABLE users ADD COLUMN revisit_reminder_no_response INTEGER DEFAULT 0")
+    await _safe_add_column("users", "sheets_dirty",
+                           "ALTER TABLE users ADD COLUMN sheets_dirty BOOLEAN DEFAULT 0")
+    await _safe_add_column("users", "sheets_last_synced",
+                           "ALTER TABLE users ADD COLUMN sheets_last_synced DATETIME")
+
+    # Значения revisit_days по умолчанию для существующих услуг
+    _revisit_defaults = [
+        ("Чистка лица (механическая)", 28),
+        ("Чистка лица (комбинированная)", 28),
+        ("Пилинг поверхностный", 21),
+        ("Пилинг срединный", 42),
+        ("Ботулинотерапия (Ботокс)", 120),
+        ("Увеличение губ", 180),
+        ("Биоревитализация", 90),
+        ("Контурная пластика", 180),
+        ("Мезотерапия", 30),
+        ("Лазерная депиляция", 42),
+    ]
+    for svc_name, days in _revisit_defaults:
+        await session.execute(
+            text("UPDATE services SET revisit_days = :days WHERE name = :name AND revisit_days IS NULL"),
+            {"days": days, "name": svc_name},
+        )
+    await session.commit()
+
+    # Индекс для CRM-запросов
+    try:
+        await session.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_users_next_visit ON users(next_visit_at) WHERE next_visit_at IS NOT NULL"
+        ))
+        await session.commit()
+    except Exception:
+        pass
+
     # Обновление цены консультации
     result = await session.execute(
         select(Service).where(Service.name == "Консультация косметолога")
@@ -524,6 +631,8 @@ async def apply_migrations(session: AsyncSession) -> None:
         "CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status)",
         "CREATE INDEX IF NOT EXISTS idx_bookings_preferred_date ON bookings(preferred_date)",
         "CREATE INDEX IF NOT EXISTS idx_bookings_created_at ON bookings(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_bookings_service_id ON bookings(service_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bookings_reminders ON bookings(status, preferred_date) WHERE status = 'confirmed'",
         "CREATE INDEX IF NOT EXISTS idx_bookings_completed_at ON bookings(completed_at)",
         "CREATE INDEX IF NOT EXISTS idx_bonus_tx_booking_id ON bonus_transactions(booking_id)",
         "CREATE INDEX IF NOT EXISTS idx_bonus_tx_booking_amount ON bonus_transactions(booking_id, amount)",
@@ -543,15 +652,59 @@ async def apply_migrations(session: AsyncSession) -> None:
     await session.commit()
     logger.info("Миграция: индексы созданы.")
 
+    # Миграция: добавляем tx_type в bonus_transactions
+    await _safe_add_column("bonus_transactions", "tx_type",
+                           "ALTER TABLE bonus_transactions ADD COLUMN tx_type VARCHAR(20) NOT NULL DEFAULT 'MANUAL'")
+
+    # Заполняем tx_type для существующих записей на основе description
+    _tx_type_updates = [
+        ("при подтверждении", "CONFIRM_BONUS"),
+        ("за лояльность", "CONFIRM_BONUS"),
+        ("выполненную запись", "VISIT_BONUS"),
+        ("Списание бонусов", "SPEND"),
+        ("Возврат бонусов", "REFUND"),
+        ("Отзыв бонуса", "REVOKE"),
+        ("Отмена начисления", "REVOKE"),
+        ("Корректировка", "MANUAL"),
+        ("Ручное начисление", "MANUAL"),
+    ]
+    for pattern, tx_type_val in _tx_type_updates:
+        await session.execute(
+            text(f"UPDATE bonus_transactions SET tx_type = :tx_type "
+                 f"WHERE description LIKE :pattern AND tx_type = 'MANUAL'"),
+            {"tx_type": tx_type_val, "pattern": f"%{pattern}%"},
+        )
+    await session.commit()
+
+    # Индекс на tx_type
+    try:
+        await session.execute(text("CREATE INDEX IF NOT EXISTS idx_bonus_tx_type ON bonus_transactions(tx_type)"))
+        await session.commit()
+    except Exception:
+        pass
+
+    # Unique constraint: один CONFIRM_BONUS и один VISIT_BONUS на запись
+    try:
+        await session.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bonus_tx_unique_grant "
+            "ON bonus_transactions(booking_id, tx_type) "
+            "WHERE booking_id IS NOT NULL AND tx_type IN ('CONFIRM_BONUS', 'VISIT_BONUS') AND amount > 0"
+        ))
+        await session.commit()
+    except Exception:
+        pass
+
+    # REVOKE идемпотентность — через application-level check (description-based),
+    # т.к. на одной записи может быть REVOKE для CONFIRM_BONUS и REVOKE для VISIT_BONUS
+
     # Новые услуги (добавляются если не существуют)
+    # Примечание: «Ботулинотерапия (Ботокс)» и «Липолитики» уже в seed_data — не дублируем
     new_services = [
-        ("Ботулинотерапия (Ботокс)", "Инъекции", "Ботулинотерапия — расслабление мышц.", 8000, 30),
         ("Ботокс — лоб", "Инъекции", "Ботулинотерапия зоны лба.", 5000, 20),
         ("Ботокс — межбровка", "Инъекции", "Ботулинотерапия межбровных морщин.", 4000, 20),
         ("Ботокс — гусиные лапки", "Инъекции", "Ботулинотерапия периорбитальной зоны.", 5000, 20),
         ("Ботокс — полное лицо", "Инъекции", "Ботулинотерапия всех зон лица.", 15000, 45),
         ("Ботокс — гипергидроз (подмышки)", "Инъекции", "Лечение гипергидроза ботулотоксином.", 12000, 30),
-        ("Липолитики", "Инъекции", "Инъекционная липолитическая терапия.", 8000, 40),
         ("Morpheus8 (фракционный RF-лифтинг)", "Аппаратные", "Фракционный RF-лифтинг Morpheus8.", 18000, 60),
         ("BBL (BroadBand Light — фотоомоложение)", "Аппаратные", "Фотоомоложение BBL.", 12000, 45),
         ("Лазерная депиляция", "Лазер", "Лазерная депиляция — общее.", 5000, 30),

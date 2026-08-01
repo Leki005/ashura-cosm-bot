@@ -15,6 +15,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import Config
 from utils.text_format import truncate_button
 
+# Telegram callback_data max length: 64 bytes
+_CALLBACK_MAX_LEN = 64
+
+
+def _safe_callback_data(data: str) -> str:
+    """Ensure callback_data fits Telegram's 64-byte limit."""
+    encoded = data.encode("utf-8")
+    if len(encoded) <= _CALLBACK_MAX_LEN:
+        return data
+    # Truncate preserving utf-8 boundary
+    while len(data.encode("utf-8")) > _CALLBACK_MAX_LEN:
+        data = data[:-1]
+    return data
+
 
 def _international_phone(phone: str) -> str:
     """Преобразует номер в международный формат для tel:/wa.me ссылок."""
@@ -144,6 +158,7 @@ def restart_confirm_keyboard() -> InlineKeyboardMarkup:
 ANAMNESIS_QUESTIONS = [
     ("Есть ли аллергия на косметику?", "allergy"),
     ("Беременность / кормление грудью?", "pregnancy"),
+    ("Менструация сейчас?", "menstruation"),
     ("Принимаете ли антикоагулянты?", "anticoagulants"),
     ("Есть ли герпес в активной фазе?", "herpes"),
     ("Есть ли воспаления на коже?", "inflammation"),
@@ -170,9 +185,13 @@ def anamnesis_keyboard(
     if question_index < len(ANAMNESIS_QUESTIONS):
         _, q_key = ANAMNESIS_QUESTIONS[question_index]
         builder.row(
-            InlineKeyboardButton(text="✅ Нет, всё ок", callback_data=f"{prefix}{q_key}_no"),
-            InlineKeyboardButton(text="⚠️ Да, есть проблема", callback_data=f"{prefix}{q_key}_yes"),
+            InlineKeyboardButton(text="✅ Нет, всё ок", callback_data=_safe_callback_data(f"{prefix}{q_key}_no")),
+            InlineKeyboardButton(text="⚠️ Да, есть проблема", callback_data=_safe_callback_data(f"{prefix}{q_key}_yes")),
         )
+
+    # Кнопка пропуска анкеты (Grok спросит аллергию + менструацию)
+    if question_index == 0:
+        builder.row(InlineKeyboardButton(text="⏩ Пропустить анкету", callback_data="anam_skip_all"))
 
     return builder.as_markup()
 
@@ -197,6 +216,9 @@ CATEGORY_MAP = {
     "inject": "Инъекции",
     "body": "Уход за телом",
     "extra": "Дополнительно",
+    "hardware": "Аппаратные",
+    "laser": "Лазер",
+    "consult": "Консультации",
 }
 
 
@@ -207,6 +229,8 @@ def services_categories_keyboard() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="✨ Пилинги", callback_data="cat_peel"))
     builder.row(InlineKeyboardButton(text="💉 Инъекции", callback_data="cat_inject"))
     builder.row(InlineKeyboardButton(text="🦵 Уход за телом", callback_data="cat_body"))
+    builder.row(InlineKeyboardButton(text="🔬 Аппаратные", callback_data="cat_hardware"))
+    builder.row(InlineKeyboardButton(text="⚡ Лазер", callback_data="cat_laser"))
     builder.row(InlineKeyboardButton(text="🎁 Дополнительно", callback_data="cat_extra"))
     builder.row(InlineKeyboardButton(text="📋 Все услуги", callback_data="cat_all"))
     builder.row(InlineKeyboardButton(text="🔙 В главное меню", callback_data="menu_main"))
@@ -273,6 +297,9 @@ def booking_date_keyboard() -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(text="✏️ Другая дата", callback_data="bdate_manual"),
     )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Назад к процедурам", callback_data="booking_back_to_procedures"),
+    )
     return builder.as_markup()
 
 
@@ -318,6 +345,9 @@ def booking_procedure_keyboard() -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(text="✏️ Другое", callback_data="proc_other"),
     )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Назад в меню", callback_data="menu_main"),
+    )
     return builder.as_markup()
 
 
@@ -349,6 +379,7 @@ def booking_time_keyboard(date_str: str | None = None) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(text="◀️ Изменить дату", callback_data="booking_edit_date"),
+        InlineKeyboardButton(text="🔙 Назад к процедурам", callback_data="booking_back_to_procedures"),
     )
     return builder.as_markup()
 
@@ -364,7 +395,7 @@ def active_booking_choice_keyboard(
     builder.row(
         InlineKeyboardButton(
             text="🔗 Совместить с текущей записью",
-            callback_data=f"merge_combine_{booking_id}_{service_id}",
+            callback_data=_safe_callback_data(f"merge_combine_{booking_id}_{service_id}"),
         )
     )
     builder.row(
@@ -385,7 +416,7 @@ def merge_confirm_keyboard(booking_id: int, service_id: int) -> InlineKeyboardMa
     builder.row(
         InlineKeyboardButton(
             text="✅ Да, добавить к записи",
-            callback_data=f"merge_confirm_{booking_id}_{service_id}",
+            callback_data=_safe_callback_data(f"merge_confirm_{booking_id}_{service_id}"),
         ),
         InlineKeyboardButton(text="❌ Нет", callback_data="menu_main"),
     )
@@ -415,9 +446,9 @@ def admin_contact_client_button(
 ) -> InlineKeyboardButton:
     """Кнопка «Связаться с клиентом» — по заявке или по Telegram ID."""
     if booking_id is not None:
-        callback_data = f"admin_msg_{booking_id}"
+        callback_data = _safe_callback_data(f"admin_msg_{booking_id}")
     elif telegram_id is not None:
-        callback_data = f"admin_contact_{telegram_id}"
+        callback_data = _safe_callback_data(f"admin_contact_{telegram_id}")
     else:
         raise ValueError("Нужен booking_id или telegram_id")
     return InlineKeyboardButton(
@@ -608,7 +639,7 @@ def admin_bonus_amount_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
         *[
             InlineKeyboardButton(
                 text=f"+{amount}",
-                callback_data=f"bonus_add_{telegram_id}_{amount}",
+                callback_data=_safe_callback_data(f"bonus_add_{telegram_id}_{amount}"),
             )
             for amount in presets[:3]
         ]
@@ -617,7 +648,7 @@ def admin_bonus_amount_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
         *[
             InlineKeyboardButton(
                 text=f"+{amount}",
-                callback_data=f"bonus_add_{telegram_id}_{amount}",
+                callback_data=_safe_callback_data(f"bonus_add_{telegram_id}_{amount}"),
             )
             for amount in presets[3:]
         ]
@@ -625,7 +656,7 @@ def admin_bonus_amount_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(
             text="✏️ Другая сумма",
-            callback_data=f"bonus_add_custom_{telegram_id}",
+            callback_data=_safe_callback_data(f"bonus_add_custom_{telegram_id}"),
         )
     )
     builder.row(InlineKeyboardButton(text="🔙 Отмена", callback_data="admin_bonuses"))
@@ -633,26 +664,32 @@ def admin_bonus_amount_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
 
 
 def post_procedure_feedback_keyboard(booking_id: int) -> InlineKeyboardMarkup:
-    """Кнопки ответа на опрос «как прошла процедура»."""
+    """Кнопки ответа на опрос «как самочувствие после процедуры»."""
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
             text="😊 Всё отлично!",
-            callback_data=f"followup_great_{booking_id}",
+            callback_data=_safe_callback_data(f"followup_great_{booking_id}"),
         ),
         InlineKeyboardButton(
             text="🙂 Хорошо",
-            callback_data=f"followup_good_{booking_id}",
+            callback_data=_safe_callback_data(f"followup_good_{booking_id}"),
         ),
     )
     builder.row(
         InlineKeyboardButton(
             text="💬 Рассказать подробнее",
-            callback_data=f"followup_text_{booking_id}",
+            callback_data=_safe_callback_data(f"followup_text_{booking_id}"),
         ),
         InlineKeyboardButton(
             text="❓ Есть вопрос",
-            callback_data=f"followup_question_{booking_id}",
+            callback_data=_safe_callback_data(f"followup_question_{booking_id}"),
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🚨 Срочно / осложнения",
+            callback_data=_safe_callback_data(f"followup_urgent_{booking_id}"),
         ),
     )
     builder.row(
@@ -846,6 +883,8 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"))
     builder.row(InlineKeyboardButton(text="★ Модерация отзывов", callback_data="admin_reviews"))
     builder.row(InlineKeyboardButton(text="🎁 Управление бонусами", callback_data="admin_bonuses"))
+    builder.row(InlineKeyboardButton(text="👤 CRM — Клиенты", callback_data="admin_crm"))
+    builder.row(InlineKeyboardButton(text="📊 Google Sheets", callback_data="admin_sheets"))
     builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"))
     builder.row(InlineKeyboardButton(text="⚙️ Управление услугами", callback_data="admin_services"))
     builder.row(InlineKeyboardButton(text="❓ Управление FAQ", callback_data="admin_faq"))
@@ -987,20 +1026,6 @@ def back_to_main_keyboard() -> InlineKeyboardMarkup:
 # АНАМНЕЗ КОЖИ — Клавиатуры для 7 блоков
 # =============================================================================
 
-# Стартовый экран
-def skin_start_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="Да, поехали! 🚀", callback_data="skin_go"))
-    builder.row(InlineKeyboardButton(text="Зачем это нужно? 🤔", callback_data="skin_why"))
-    return builder.as_markup()
-
-
-def skin_why_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="Понятно, начинаем! 🚀", callback_data="skin_go"))
-    return builder.as_markup()
-
-
 # Блок 1: Общая информация
 SKIN_AGE_CHOICES = [
     ("18-25", "18-25"), ("26-35", "26-35"), ("36-45", "36-45"),
@@ -1022,13 +1047,6 @@ SKIN_SEASON_CHOICES = [
     ("Хуже обычного 😕", "worse"),
     ("Катастрофа 🆘", "crisis"),
 ]
-
-
-def skin_choice_keyboard(choices: list[tuple[str, str]], prefix: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for text, value in choices:
-        builder.row(InlineKeyboardButton(text=text, callback_data=f"{prefix}_{value}"))
-    return builder.as_markup()
 
 
 def skin_skip_keyboard() -> InlineKeyboardMarkup:
@@ -1179,14 +1197,4 @@ def skin_goals_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
         mark = "✅ " if value in selected else ""
         builder.row(InlineKeyboardButton(text=f"{mark}{text}", callback_data=f"skgoal_{value}"))
     builder.row(InlineKeyboardButton(text="✅ Готово", callback_data="skgoal_done"))
-    return builder.as_markup()
-
-
-# Финал
-def skin_final_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🗓 Записаться к Ашуре", callback_data="menu_booking"))
-    builder.row(InlineKeyboardButton(text="💬 Задать вопрос ИИ", callback_data="menu_ai_consultant"))
-    builder.row(InlineKeyboardButton(text="🔄 Пройти заново", callback_data="skin_restart"))
-    builder.row(InlineKeyboardButton(text="☰ Главное меню", callback_data="menu_main"))
     return builder.as_markup()

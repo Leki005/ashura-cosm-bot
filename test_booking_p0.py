@@ -386,15 +386,11 @@ async def test_broadcast_sends_plain_text_no_parse_mode():
     mock_bot = AsyncMock()
     mock_bot.send_message = AsyncMock()
 
-    # Create a mock user
-    mock_user = MagicMock()
-    mock_user.telegram_id = 800_001
-
     # Text with HTML-like content
     broadcast_text = "<b>Bold</b> & <script>alert('xss')</script>"
 
-    # Call _send_broadcast
-    await _send_broadcast(mock_bot, [mock_user], broadcast_text, admin_id=123)
+    # Call _send_broadcast with telegram_ids (list[int])
+    await _send_broadcast(mock_bot, [800_001], broadcast_text, admin_id=123)
 
     # Find the call that sent to the user (not the admin report)
     user_calls = [

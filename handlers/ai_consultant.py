@@ -31,6 +31,7 @@ router = Router()
 PHOTO_MIN_WIDTH = 400       # Минимальная ширина в пикселях
 PHOTO_MIN_HEIGHT = 400      # Минимальная высота в пикселях
 PHOTO_MIN_FILE_SIZE = 30_000  # Минимальный размер файла (30KB)
+PHOTO_MAX_FILE_SIZE = 10_000_000  # Максимальный размер файла (10MB) — Grok API лимит
 PHOTO_RATE_LIMIT_SECONDS = 30  # Минимум секунд между фото
 PHOTO_MAX_PER_SESSION = 10     # Максимум фото за сессию
 
@@ -198,7 +199,7 @@ async def ai_consultant_message(message: Message, state: FSMContext) -> None:
     except GrokAPIError as e:
         logger.warning("Grok error for user %s: %s", message.from_user.id, e)
         await message.answer(
-            f"{AI_UNAVAILABLE}\n\n<i>Техническая информация: {html_escape(str(e))}</i>",
+            AI_UNAVAILABLE,
             reply_markup=ai_consultant_keyboard(),
         )
         return
@@ -243,6 +244,14 @@ async def ai_consultant_photo(message: Message, state: FSMContext) -> None:
     if photo.file_size and photo.file_size < PHOTO_MIN_FILE_SIZE:
         await message.answer(
             PHOTO_TOO_SMALL,
+            reply_markup=ai_consultant_keyboard(),
+        )
+        return
+
+    # Проверка максимального размера файла (Grok API лимит)
+    if photo.file_size and photo.file_size > PHOTO_MAX_FILE_SIZE:
+        await message.answer(
+            "📷 Фото слишком большое. Пожалуйста, отправьте фото меньшего размера (до 10 МБ).",
             reply_markup=ai_consultant_keyboard(),
         )
         return

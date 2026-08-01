@@ -13,7 +13,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from html import escape as html_escape
 
 from aiogram import Bot, F, Router
@@ -54,6 +54,7 @@ from keyboards import (
     back_to_main_keyboard,
 )
 from utils.audit import log_admin_action
+from utils.bonus_service import grant_loyalty_bonus
 from utils.helpers import (
     add_bonus_transaction,
     parse_callback_int,
@@ -62,7 +63,6 @@ from utils.helpers import (
     format_price,
     format_stats,
     get_stats,
-    grant_confirmation_bonus,
     notify_client_booking_cancelled,
     notify_client_booking_confirmed,
     send_message_to_owner,
@@ -99,7 +99,7 @@ class AdminOnlyMiddleware:
         if not user:
             return None
         
-        if user.id != Config.ADMIN_ID:
+        if user.id not in (Config.ADMIN_ID, Config.OWNER_ID):
             if hasattr(event, 'answer'):
                 try:
                     await event.answer('⛔ Нет доступа!', show_alert=True)
@@ -114,6 +114,12 @@ router = Router()
 router.message.middleware(AdminOnlyMiddleware())
 router.callback_query.middleware(AdminOnlyMiddleware())
 
+
+# Block group/supergroup messages — bot works only in private chats
+@router.message(F.chat.type != "private")
+async def _block_group_messages(message: Message) -> None:
+    return
+
 # =============================================================================
 # КОНСТАНТЫ СТАТУСОВ
 # =============================================================================
@@ -122,12 +128,14 @@ STATUS_PENDING = "pending"
 STATUS_CONFIRMED = "confirmed"
 STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
+STATUS_EXPIRED = "expired"
 
 STATUS_NAMES = {
     STATUS_PENDING: "🆕 Новые",
     STATUS_CONFIRMED: "✅ Подтверждённые",
     STATUS_COMPLETED: "🏁 Выполненные",
     STATUS_CANCELLED: "❌ Отменённые",
+    STATUS_EXPIRED: "⏰ Просроченные",
 }
 
 
@@ -137,7 +145,7 @@ STATUS_NAMES = {
 
 async def is_admin(telegram_id: int) -> bool:
     """Проверяет, является ли пользователь администратором."""
-    return telegram_id == Config.ADMIN_ID
+    return telegram_id in (Config.ADMIN_ID, Config.OWNER_ID)
 
 
 async def _booking_status_counts(session: AsyncSession) -> dict[str, int]:
@@ -190,8 +198,8 @@ def _format_admin_booking_card(
         f"🆔 <b>#{booking.id}</b> | {status_label}\n"
         f"👤 <b>{html_escape(user.name)}</b> | 📱 {format_phone(user.phone)}\n"
         f"{format_pd_consent_admin_line(user)}"
-        f"💅 <b>{service_name}</b>\n"
-        f"📅 Когда: {when}"
+        f"💅 <b>{html_escape(service_name)}</b>\n"
+        f"📅 Когда: {html_escape(when)}"
         f"{confirmed_text}\n"
         f"📝 {html_escape(booking.notes) if booking.notes else '—'}\n"
         f"{anam_text}"
@@ -200,13 +208,13 @@ def _format_admin_booking_card(
     )
 
 
-def _bonus_granted_line(bonus_granted: int) -> str:
-    """Строка для админа о начисленных бонусах при подтверждении."""
+def _bonus_granted_line(bonus_granted: int, discount_percent: int = 0) -> str:
+    """Строка для админа о начисленных бонусах за лояльность."""
     if bonus_granted <= 0:
         return ""
+    pct = discount_percent or Config.BONUS_PERCENT
     return (
-        f"🎁 Клиентке начислено +{bonus_granted} бонусов "
-        f"({Config.BONUS_PERCENT}% скидка).\n"
+        f"🎁 Скидка за лояльность: {pct}% → +{bonus_granted} бонусов\n"
     )
 
 
@@ -253,12 +261,12 @@ async def _confirm_booking(
     *,
     when_label: str,
     admin_id: int,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, int]:
     """
-    Переводит заявку в confirmed, начисляет 3% бонусов и уведомляет клиента.
-    Возвращает (доставлено_уведомление, сумма_бонусов).
+    Переводит заявку в confirmed, начисляет бонусы за лояльность и уведомляет клиента.
+    Возвращает (доставлено_уведомление, сумма_бонусов, процент_скидки).
     """
-    from utils.helpers import now_salon
+    from utils.helpers import now_salon, get_loyalty_discount_percent, _count_completed_visits
     from sqlalchemy import update as sa_update
     # Атомарное обновление статуса — защита от double-confirm
     result = await session.execute(
@@ -267,17 +275,21 @@ async def _confirm_booking(
         .values(status=STATUS_CONFIRMED, confirmed_at=now_salon())
     )
     if result.rowcount == 0:
-        return False, 0  # уже подтверждена другим запросом
+        return False, 0, 0  # уже подтверждена другим запросом
     # Перезагружаем booking вместе с user relationship
     from sqlalchemy.orm import joinedload
     fresh = await session.execute(
-        select(Booking).options(joinedload(Booking.user)).where(Booking.id == booking.id)
+        select(Booking).options(joinedload(Booking.user), joinedload(Booking.service)).where(Booking.id == booking.id)
     )
     booking = fresh.scalar_one_or_none()
     if not booking:
-        return False, "Заявка не найдена."
+        return False, 0, 0
 
-    bonus_granted = await grant_confirmation_bonus(session, booking)
+    # Считаем визиты для определения скидки за лояльность
+    completed_count = await _count_completed_visits(session, booking.user_id, exclude_booking_id=booking.id)
+    discount_pct = get_loyalty_discount_percent(completed_count)
+
+    bonus_granted = await grant_loyalty_bonus(session, booking)
 
     client_tg_id = booking.user.telegram_id
     service_name = format_booking_services_line(booking)
@@ -291,17 +303,39 @@ async def _confirm_booking(
             booking,
             service_name=service_name,
             bonus_granted=bonus_granted,
+            discount_percent=discount_pct,
         )
     except Exception as e:
         logger.error("Ошибка уведомления клиента о подтверждении: %s", e)
         notified = False
 
     logger.info(
-        "Заявка #%s подтверждена, назначено: %s (уведомление: %s, бонусы: +%s)",
-        booking.id, when_label, "да" if notified else "нет", bonus_granted,
+        "Заявка #%s подтверждена, назначено: %s (уведомление: %s, бонусы: +%s, скидка: %d%%)",
+        booking.id, when_label, "да" if notified else "нет", bonus_granted, discount_pct,
     )
     log_admin_action(admin_id, 'accept_booking', f'#{booking.id}', when_label)
-    return notified, bonus_granted
+
+    # Google Sheets sync
+    try:
+        from utils.google_sheets import mark_dirty
+        await mark_dirty(session, booking.user_id, reason='confirm')
+    except Exception as e:
+        logger.debug("Sheets mark_dirty failed: %s", e)
+
+    # Авто-памятка ДО процедуры
+    try:
+        from utils.waiting_and_reminders import get_before_reminder
+        before_text = get_before_reminder(service_name)
+        await bot.send_message(
+            chat_id=client_tg_id,
+            text=f"<b>📋 Памятка перед процедурой:</b>\n\n{before_text}",
+            parse_mode="HTML",
+        )
+        logger.info("Памятка ДО отправлена клиенту %s (%s)", client_tg_id, service_name)
+    except Exception as e:
+        logger.warning("Не удалось отправить памятку ДО: %s", e)
+
+    return notified, bonus_granted, discount_pct
 
 
 async def _fetch_booking(
@@ -468,6 +502,18 @@ async def admin_accept_quick(
     collision = await _check_slot_collision(session, booking)
 
     if collision:
+        # Отправляем тревожное сообщение админу
+        try:
+            await callback.bot.send_message(
+                chat_id=Config.ADMIN_ID,
+                text=f"🚨 <b>Конфликт расписания!</b>\n\n"
+                     f"{collision}\n\n"
+                     f"Проверьте расписание в CRM-Доске.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить алерт о коллизии: %s", e)
+
         # Есть коллизия — спрашиваем подтверждение
         builder = InlineKeyboardBuilder()
         builder.row(
@@ -486,7 +532,7 @@ async def admin_accept_quick(
         )
         return
 
-    notified, bonus_granted = await _confirm_booking(
+    notified, bonus_granted, discount_pct = await _confirm_booking(
         session, callback.bot, booking, when_label=when_label,
         admin_id=callback.from_user.id,
     )
@@ -500,7 +546,7 @@ async def admin_accept_quick(
         f"✅ <b>Заявка #{booking_id} подтверждена!</b>\n\n"
         f"📅 Назначено: {when_label}\n"
         f"{notify_line}"
-        f"{_bonus_granted_line(bonus_granted)}\n"
+        f"{_bonus_granted_line(bonus_granted, discount_pct)}\n"
         f"Теперь она в разделе «Подтверждённые».",
         parse_mode="HTML",
     )
@@ -526,7 +572,7 @@ async def admin_force_accept(
 
     await callback.answer()
     when_label = _format_booking_when(booking)
-    notified, bonus_granted = await _confirm_booking(
+    notified, bonus_granted, discount_pct = await _confirm_booking(
         session, callback.bot, booking, when_label=when_label,
         admin_id=callback.from_user.id,
     )
@@ -540,7 +586,7 @@ async def admin_force_accept(
         f"✅ <b>Заявка #{booking_id} подтверждена!</b>\n\n"
         f"📅 Назначено: {when_label}\n"
         f"{notify_line}"
-        f"{_bonus_granted_line(bonus_granted)}\n"
+        f"{_bonus_granted_line(bonus_granted, discount_pct)}\n"
         f"Теперь она в разделе «Подтверждённые».",
         parse_mode="HTML",
     )
@@ -669,11 +715,54 @@ async def process_accept_datetime(
         await msg.answer("⚠️ Некорректная дата. Проверьте число и месяц.")
         return
 
+    # Проверка: нельзя ставить время в прошлом
+    from utils.helpers import check_booking_time_allowed
+    ok, err = check_booking_time_allowed(date_part, time_part)
+    if not ok:
+        await msg.answer(f"⚠️ {err}")
+        return
+
     booking.preferred_date = date_part
     booking.preferred_time = time_part
 
+    # Проверка конфликта расписания (после установки даты — чтобы force_accept работал)
+    from utils.google_sheets import check_schedule_conflict
+    has_conflict, conflict_desc = await check_schedule_conflict(
+        session, date_part, time_part, exclude_booking_id=booking_id,
+    )
+    if has_conflict:
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(
+                text="✅ Всё равно подтвердить",
+                callback_data=f"admin_force_accept_{booking_id}",
+            ),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back"),
+        )
+        await msg.answer(
+            f"🚨 <b>Конфликт расписания!</b>\n\n{conflict_desc}\n\n"
+            f"Выберите другое время или подтвердите принудительно.",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML",
+        )
+        return
+
     collision = await _check_slot_collision(session, booking)
-    notified, bonus_granted = await _confirm_booking(
+
+    # Отправляем тревожное сообщение админу при коллизии
+    if collision:
+        try:
+            await msg.bot.send_message(
+                chat_id=Config.ADMIN_ID,
+                text=f"🚨 <b>Конфликт расписания!</b>\n\n"
+                     f"{collision}\n\n"
+                     f"Проверьте расписание в CRM-Доске.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить алерт о коллизии: %s", e)
+
+    notified, bonus_granted, discount_pct = await _confirm_booking(
         session, msg.bot, booking, when_label=datetime_str,
         admin_id=msg.from_user.id,
     )
@@ -687,7 +776,7 @@ async def process_accept_datetime(
         f"✅ <b>Заявка #{booking_id} принята!</b>\n\n"
         f"📅 Назначено: {datetime_str}\n"
         f"{notify_line}"
-        f"{_bonus_granted_line(bonus_granted)}{collision}\n"
+        f"{_bonus_granted_line(bonus_granted, discount_pct)}{collision}\n"
         f"Теперь она в разделе «Подтверждённые».",
         parse_mode="HTML",
     )
@@ -737,9 +826,9 @@ async def process_reject_reason(
         await state.clear()
         return
 
-    # Только pending/confirmed/completed можно отклонить
-    if booking.status not in (STATUS_PENDING, STATUS_CONFIRMED, STATUS_COMPLETED):
-        await msg.answer(f"⚠️ Заявка #{booking_id} уже в статусе: {booking.status}. Нельзя отклонить.")
+    # Только pending/confirmed можно отклонить (completed — нельзя, это уже факт визита)
+    if booking.status not in (STATUS_PENDING, STATUS_CONFIRMED):
+        await msg.answer(f"⚠️ Заявка #{booking_id} в статусе «{booking.status}». Нельзя отклонить завершённую запись.")
         await state.clear()
         return
 
@@ -749,7 +838,7 @@ async def process_reject_reason(
     from sqlalchemy import update as sa_update
     result = await session.execute(
         sa_update(Booking)
-        .where(Booking.id == booking.id, Booking.status.in_((STATUS_PENDING, STATUS_CONFIRMED, STATUS_COMPLETED)))
+        .where(Booking.id == booking.id, Booking.status.in_((STATUS_PENDING, STATUS_CONFIRMED)))
         .values(status=STATUS_CANCELLED)
     )
     if result.rowcount == 0:
@@ -782,14 +871,15 @@ async def process_reject_reason(
             bonus_refunded,
             f"Возврат бонусов при отклонении записи #{booking_id}",
             booking_id=booking_id,
+            tx_type=BonusTransaction.TX_REFUND,
         )
 
-    # Отзыв бонуса, начисленного при подтверждении (+3%) — атомарно
+    # Отзыв бонуса, начисленного при подтверждении — атомарно
     confirmation_tx = await session.execute(
         select(BonusTransaction).where(
             BonusTransaction.booking_id == booking_id,
+            BonusTransaction.tx_type == BonusTransaction.TX_CONFIRM_BONUS,
             BonusTransaction.amount > 0,
-            BonusTransaction.description.contains("при подтверждении"),
         )
     )
     conf_tx = confirmation_tx.scalar_one_or_none()
@@ -808,14 +898,15 @@ async def process_reject_reason(
             -bonus_revoked,
             f"Отзыв бонуса при отмене записи #{booking_id}",
             booking_id=booking_id,
+            tx_type=BonusTransaction.TX_REVOKE,
         )
 
     # Отзыв бонуса за визит (начисление при завершении) — атомарно
     visit_tx = await session.execute(
         select(BonusTransaction).where(
             BonusTransaction.booking_id == booking_id,
+            BonusTransaction.tx_type == BonusTransaction.TX_VISIT_BONUS,
             BonusTransaction.amount > 0,
-            BonusTransaction.description.contains("за выполненную запись"),
         )
     )
     visit_tx_row = visit_tx.scalar_one_or_none()
@@ -834,6 +925,7 @@ async def process_reject_reason(
             -visit_bonus_revoked,
             f"Отзыв бонуса визита при отмене записи #{booking_id}",
             booking_id=booking_id,
+            tx_type=BonusTransaction.TX_REVOKE,
         )
         bonus_revoked += visit_bonus_revoked
 
@@ -865,6 +957,22 @@ async def process_reject_reason(
     await msg.answer(
         f"❌ Заявка #{booking_id} отклонена. Клиент уведомлён.{refund_line}"
     )
+
+    # Уведомляем лист ожидания на эту дату
+    try:
+        if booking.preferred_date:
+            from utils.waiting_and_reminders import notify_waiting_users
+            service_name_short = format_booking_services_line(booking)
+            count = await notify_waiting_users(
+                session, msg.bot, booking.preferred_date,
+                booking.preferred_time or "—", service_name_short
+            )
+            if count > 0:
+                logger.info("Уведомлено %d клиентов из листа ожидания на %s", count, booking.preferred_date)
+                await msg.answer(f"📋 Уведомлено {count} клиент(ов) из листа ожидания.")
+    except Exception as e:
+        logger.warning("Ошибка уведомления листа ожидания: %s", e)
+
     await state.clear()
 
 
@@ -943,9 +1051,32 @@ async def process_done_amount(
         return
     await session.refresh(booking)
 
+    # Получаем user ДО CRM-логики
+    user = booking.user
+
+    # CRM: пересчёт next_visit_at при завершении визита
+    if booking.service_id:
+        svc_result = await session.execute(select(Service).where(Service.id == booking.service_id))
+        svc = svc_result.scalar_one_or_none()
+        if svc and svc.revisit_days and not user.next_visit_manual:
+            from datetime import timedelta
+            user.next_visit_at = now_salon() + timedelta(days=svc.revisit_days)
+            # Сбрасываем churn-флаги — клиент вернулся
+            user.churn_alert_30_sent = False
+            user.churn_alert_60_sent = False
+            user.revisit_reminder_sent_for = None
+            logger.info("CRM: next_visit_at=%s для user %s (услуга: %s, %d дней)",
+                        user.next_visit_at, user.telegram_id, svc.name, svc.revisit_days)
+
     log_admin_action(msg.from_user.id, 'complete_booking', f'#{booking_id}', f'amount={amount}')
 
-    user = booking.user
+    # Google Sheets sync
+    try:
+        from utils.google_sheets import mark_dirty
+        await mark_dirty(session, booking.user_id, reason='complete')
+    except Exception as e:
+        logger.debug("Sheets mark_dirty failed: %s", e)
+
     service_name = format_booking_services_line(booking)
 
     await msg.answer(
@@ -955,6 +1086,19 @@ async def process_done_amount(
         f"👤 Клиент: {html_escape(user.name)}",
         parse_mode="HTML",
     )
+
+    # Авто-памятка ПОСЛЕ процедуры
+    try:
+        from utils.waiting_and_reminders import get_after_reminder
+        after_text = get_after_reminder(service_name)
+        await msg.bot.send_message(
+            chat_id=user.telegram_id,
+            text=f"<b>📋 Памятка после процедуры:</b>\n\n{after_text}",
+            parse_mode="HTML",
+        )
+        logger.info("Памятка ПОСЛЕ отправлена клиенту %s (%s)", user.telegram_id, service_name)
+    except Exception as e:
+        logger.warning("Не удалось отправить памятку ПОСЛЕ: %s", e)
 
     # Предлагаем начислить бонусы за визит (показываем реальную сумму бонуса, а не цену)
     suggested = _suggested_bonus_for_amount(amount)
@@ -1203,6 +1347,8 @@ async def broadcast_preview(
     message: Message, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Показывает превью рассылки."""
+    if message.text and message.text.startswith('/'):
+        return
     broadcast_text = message.text
     await state.update_data(broadcast_text=broadcast_text)
 
@@ -1259,7 +1405,7 @@ async def broadcast_send(
     segment = data.get("broadcast_segment", "all")
 
     # Фильтруем пользователей по сегменту
-    query = select(User)
+    query = select(User).where(User.pd_consent_at.isnot(None)).where(User.name.notlike('Удалён_%'))
     if segment == "active":
         query = query.where(
             User.id.in_(
@@ -1278,17 +1424,25 @@ async def broadcast_send(
     result = await session.execute(query)
     users = result.scalars().all()
 
-    # Запускаем рассылку в фоновой задаче
+    # Извлекаем telegram_id ДО создания task — ORM объекты уничтожаются после commit
+    user_telegram_ids = [u.telegram_id for u in users]
+
+    # Проверяем не идёт ли уже рассылка
     global _broadcast_task
+    if _broadcast_task and not _broadcast_task.done():
+        await callback.answer("Рассылка уже идёт, подождите завершения.", show_alert=True)
+        return
+
+    # Запускаем рассылку в фоновой задаче
     _broadcast_task = asyncio.create_task(
-        _send_broadcast(callback.bot, users, broadcast_text, callback.from_user.id)
+        _send_broadcast(callback.bot, user_telegram_ids, broadcast_text, callback.from_user.id)
     )
 
-    log_admin_action(callback.from_user.id, 'broadcast', segment, f'{len(users)} users')
+    log_admin_action(callback.from_user.id, 'broadcast', segment, f'{len(user_telegram_ids)} users')
 
     await callback.message.answer(
         f"📢 <b>Рассылка запущена!</b>\n\n"
-        f"Отправляется {len(users)} клиентам...\n"
+        f"Отправляется {len(user_telegram_ids)} клиентам...\n"
         f"Результат придёт отдельным сообщением.\n\n"
         f"Для отмены нажмите кнопку ниже.",
         reply_markup=InlineKeyboardMarkup(
@@ -1305,7 +1459,7 @@ _broadcast_task: asyncio.Task | None = None
 
 
 async def _send_broadcast(
-    bot: Bot, users: list, text: str, admin_id: int,
+    bot: Bot, telegram_ids: list[int], text: str, admin_id: int,
 ) -> None:
     """Фоновая отправка рассылки с задержкой между сообщениями."""
     global _broadcast_task
@@ -1315,7 +1469,7 @@ async def _send_broadcast(
     failed = 0
     cancelled = False
 
-    for i, user in enumerate(users, 1):
+    for i, tg_id in enumerate(telegram_ids, 1):
         # Проверяем не отменена ли рассылка
         if _broadcast_task and _broadcast_task.cancelled():
             cancelled = True
@@ -1323,7 +1477,7 @@ async def _send_broadcast(
 
         try:
             await bot.send_message(
-                chat_id=user.telegram_id,
+                chat_id=tg_id,
                 text=text,
                 parse_mode=None,  # plain text — безопасно, без HTML injection
             )
@@ -1334,7 +1488,7 @@ async def _send_broadcast(
             await asyncio.sleep(e.retry_after + 1)
             try:
                 await bot.send_message(
-                    chat_id=user.telegram_id,
+                    chat_id=tg_id,
                     text=text,
                     parse_mode=None,
                 )
@@ -1342,7 +1496,7 @@ async def _send_broadcast(
             except Exception:
                 failed += 1
         except Exception as e:
-            logger.warning("Не удалось отправить рассылку %s: %s", user.telegram_id, e)
+            logger.warning("Не удалось отправить рассылку %s: %s", tg_id, e)
             failed += 1
 
         # Задержка чтобы не упираться в лимиты Telegram
@@ -1353,7 +1507,7 @@ async def _send_broadcast(
             try:
                 await bot.send_message(
                     chat_id=admin_id,
-                    text=f"📢 Прогресс: {i}/{len(users)} отправлено...",
+                    text=f"📢 Прогресс: {i}/{len(telegram_ids)} отправлено...",
                 )
             except Exception:
                 pass
@@ -1420,6 +1574,8 @@ async def admin_faq_menu(callback: CallbackQuery, session: AsyncSession) -> None
         ]
     )
 
+    if len(text) > 4000:
+        text = text[:3997] + "..."
     await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
@@ -1452,7 +1608,18 @@ async def admin_services(callback: CallbackQuery, session: AsyncSession) -> None
         ]
     )
 
-    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    if len(text) > 4000:
+        parts = text.split("\n📁")
+        chunk = parts[0]
+        for part in parts[1:]:
+            if len(chunk) + len(part) + 1 > 4000:
+                await callback.message.answer(chunk, reply_markup=None, parse_mode="HTML")
+                chunk = "📁" + part
+            else:
+                chunk += "\n📁" + part
+        await callback.message.answer(chunk, reply_markup=kb, parse_mode="HTML")
+    else:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 
@@ -1477,7 +1644,7 @@ async def admin_bonuses(callback: CallbackQuery, session: AsyncSession) -> None:
     text = (
         f"🎁 <b>Управление бонусами</b>\n\n"
         f"💰 Всего бонусов у клиентов: <b>{total}</b>\n"
-        f"📌 {Config.BONUS_PERCENT}% при подтверждении записи\n"
+        f"📌 Скидка за лояльность: 0 визитов → 0%, 1-2 → 3%, 3+ → 5%\n"
         f"📌 Доп. бонусы после визита — вручную\n\n"
     )
     if top_users:
@@ -1641,6 +1808,8 @@ async def admin_faq_add_start(callback: CallbackQuery, state: FSMContext) -> Non
 @router.message(AdminFaqAddState.waiting_question, F.text)
 async def admin_faq_add_question(msg: Message, state: FSMContext) -> None:
     """Получает вопрос FAQ."""
+    if msg.text and msg.text.startswith('/'):
+        return
     await state.update_data(faq_question=msg.text.strip())
     await msg.answer("Теперь введите ответ на этот вопрос:")
     await state.set_state(AdminFaqAddState.waiting_answer)
@@ -1651,6 +1820,8 @@ async def admin_faq_add_answer(
     msg: Message, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Сохраняет новый FAQ."""
+    if msg.text and msg.text.startswith('/'):
+        return
     data = await state.get_data()
     question = data.get("faq_question", "").strip()
     answer = msg.text.strip()
@@ -1693,6 +1864,8 @@ async def admin_svc_add_start(callback: CallbackQuery, state: FSMContext) -> Non
 @router.message(AdminServiceAddState.waiting_name, F.text)
 async def admin_svc_add_name(msg: Message, state: FSMContext) -> None:
     """Получает название услуги."""
+    if msg.text and msg.text.startswith('/'):
+        return
     await state.update_data(svc_name=msg.text.strip())
     await msg.answer(
         "Введите категорию (например: «Уход за лицом», «Инъекции»):"
@@ -1703,6 +1876,8 @@ async def admin_svc_add_name(msg: Message, state: FSMContext) -> None:
 @router.message(AdminServiceAddState.waiting_category, F.text)
 async def admin_svc_add_category(msg: Message, state: FSMContext) -> None:
     """Получает категорию услуги."""
+    if msg.text and msg.text.startswith('/'):
+        return
     await state.update_data(svc_category=msg.text.strip())
     await msg.answer("Введите цену в рублях (число, например: 5000):")
     await state.set_state(AdminServiceAddState.waiting_price)
@@ -1713,6 +1888,8 @@ async def admin_svc_add_price(
     msg: Message, state: FSMContext, session: AsyncSession,
 ) -> None:
     """Сохраняет новую услугу."""
+    if msg.text and msg.text.startswith('/'):
+        return
     try:
         price = int(msg.text.strip().replace(" ", "").replace("₽", ""))
     except ValueError:
@@ -1841,7 +2018,7 @@ async def _apply_bonus_revoke(
         )
     await session.refresh(user)
 
-    await add_bonus_transaction(session, user.id, -amount, reason)
+    await add_bonus_transaction(session, user.id, -amount, reason, tx_type=BonusTransaction.TX_REVOKE)
     await session.flush()
 
     if admin_id:
@@ -1914,8 +2091,8 @@ async def _booking_bonus_already_granted(
         select(BonusTransaction.id)
         .where(
             BonusTransaction.booking_id == booking_id,
+            BonusTransaction.tx_type == BonusTransaction.TX_VISIT_BONUS,
             BonusTransaction.amount > 0,
-            BonusTransaction.description.contains("выполненную запись"),
         )
         .limit(1)
     )
@@ -1956,6 +2133,7 @@ async def _apply_bonus_grant(
     await session.refresh(user)
     await add_bonus_transaction(
         session, user.id, amount, reason, booking_id=booking_id,
+        tx_type=BonusTransaction.TX_VISIT_BONUS if booking_id else BonusTransaction.TX_MANUAL,
     )
     await session.flush()
 
@@ -2083,8 +2261,8 @@ async def admin_revoke_bonus_from_booking(
         .options(joinedload(BonusTransaction.user))
         .where(
             BonusTransaction.booking_id == booking_id,
+            BonusTransaction.tx_type == BonusTransaction.TX_CONFIRM_BONUS,
             BonusTransaction.amount > 0,
-            BonusTransaction.description.contains("при подтверждении"),
         )
     )
     tx = result.scalar_one_or_none()
@@ -2278,6 +2456,13 @@ async def admin_bonus_from_booking(
 ) -> None:
     """Начисление бонусов из карточки заявки."""
     await callback.answer()
+
+    # Убираем клавиатуру чтобы нельзя было нажать повторно
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
     booking_id = parse_callback_int(callback.data, "bonus_grant_bk_")
     if booking_id is None:
         await callback.message.answer("⚠️ Ошибка данных.")
@@ -2309,6 +2494,11 @@ async def admin_bonus_auto_from_visit(
 
     if await _booking_bonus_already_granted(session, booking_id):
         await callback.answer("Бонусы уже начислены за этот визит.", show_alert=True)
+        # Убираем клавиатру чтобы нельзя было нажать повторно
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
 
     amount = _suggested_bonus_for_amount(booking.total_amount)
@@ -2331,6 +2521,12 @@ async def admin_bonus_auto_from_visit(
         admin_id=callback.from_user.id,
     )
     await callback.answer(f"+{amount} бонусов начислено!")
+
+    # Убираем клавиатуру чтобы нельзя было нажать повторно
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     notify_line = "Клиент уведомлён." if notified else "Уведомление не доставлено."
     await callback.message.answer(
@@ -2357,6 +2553,13 @@ async def admin_bonus_skip_from_visit(
         return
 
     await callback.answer("Бонусы не начислены")
+
+    # Убираем клавиатуру чтобы нельзя было нажать повторно
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
     await callback.message.answer(
         f"⏭ Бонусы за запись #{booking_id} ({html_escape(booking.user.name)}) не начислены."
     )
@@ -2618,3 +2821,434 @@ async def cmd_reply(message: Message, session: AsyncSession) -> None:
     except Exception as e:
         logger.error("Ошибка отправки ответа: %s", e)
         await message.answer(f"❌ Не удалось отправить: {e}")
+
+
+# =============================================================================
+# CRM — КАРТОЧКА КЛИЕНТА
+# =============================================================================
+
+from utils.states import AdminCRMState
+
+@router.callback_query(F.data == "admin_crm")
+async def admin_crm_entry(
+    callback: CallbackQuery, state: FSMContext,
+) -> None:
+    """Вход в CRM — поиск клиента."""
+    await state.clear()
+    await callback.message.answer(
+        "👤 <b>CRM — Клиенты</b>\n\n"
+        "Введите <b>телефон</b>, <b>имя</b> или <b>Telegram ID</b> клиента:",
+        reply_markup=admin_back_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminCRMState.waiting_search)
+    await callback.answer()
+
+
+@router.message(AdminCRMState.waiting_search)
+async def admin_crm_search(
+    message: Message, state: FSMContext, session: AsyncSession,
+) -> None:
+    """Поиск клиента по телефону/имени/ID."""
+    query = message.text.strip()
+    if not query:
+        await message.answer("⚠️ Введите запрос для поиска.")
+        return
+
+    # Поиск по telegram_id (если число)
+    users = []
+    if query.isdigit():
+        result = await session.execute(
+            select(User).where(User.telegram_id == int(query))
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            users = [user]
+
+    # Поиск по телефону
+    if not users:
+        result = await session.execute(
+            select(User).where(User.phone.contains(query))
+        )
+        users = result.scalars().all()
+
+    # Поиск по имени
+    if not users:
+        result = await session.execute(
+            select(User).where(User.name.ilike(f"%{query}%"))
+        )
+        users = result.scalars().all()
+
+    if not users:
+        await message.answer(
+            "❌ Клиент не найден. Попробуйте другой запрос.",
+            reply_markup=admin_back_keyboard(),
+        )
+        return
+
+    if len(users) == 1:
+        await _show_client_card(message, session, users[0])
+        await state.clear()
+        return
+
+    # Несколько результатов — показываем список
+    buttons = []
+    for u in users[:10]:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{u.name} | {u.phone}",
+                callback_data=f"crm_pick_{u.telegram_id}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+    await message.answer(
+        f"🔍 Найдено {len(users)} клиентов. Выберите:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data.regexp(r"^crm_pick_(\d+)$"))
+async def admin_crm_pick(
+    callback: CallbackQuery, session: AsyncSession,
+) -> None:
+    """Клиент выбран из списка — показываем карточку."""
+    tg_id = parse_callback_int(callback.data, "crm_pick_")
+    if tg_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    result = await session.execute(select(User).where(User.telegram_id == tg_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+    await _show_client_card(callback.message, session, user)
+    await callback.answer()
+
+
+async def _show_client_card(message: Message, session: AsyncSession, user: User) -> None:
+    """Формирует и показывает карточку клиента."""
+    from utils.helpers import format_phone, now_salon, ACTIVE_BOOKING_STATUSES
+
+    # Количество визитов
+    visit_count_result = await session.execute(
+        select(sa_func.count(Booking.id))
+        .where(Booking.user_id == user.id, Booking.status == "completed")
+    )
+    visit_count = visit_count_result.scalar() or 0
+
+    # Последний визит
+    last_visit_result = await session.execute(
+        select(Booking.completed_at)
+        .where(Booking.user_id == user.id, Booking.status == "completed")
+        .order_by(Booking.completed_at.desc())
+        .limit(1)
+    )
+    last_visit = last_visit_result.scalar_one_or_none()
+
+    # Активная запись
+    active_result = await session.execute(
+        select(Booking)
+        .where(Booking.user_id == user.id, Booking.status.in_(ACTIVE_BOOKING_STATUSES))
+        .limit(1)
+    )
+    active_booking = active_result.scalar_one_or_none()
+
+    # Последние 5 визитов
+    history_result = await session.execute(
+        select(Booking)
+        .options(joinedload(Booking.service))
+        .where(Booking.user_id == user.id, Booking.status == "completed")
+        .order_by(Booking.completed_at.desc())
+        .limit(5)
+    )
+    recent_visits = history_result.scalars().all()
+
+    # Формируем карточку
+    lines = [
+        f"👤 <b>Карточка клиента</b>\n",
+        f"Имя: <b>{html_escape(user.name)}</b>",
+        f"Телефон: {format_phone(user.phone)}",
+        f"Telegram ID: <code>{user.telegram_id}</code>",
+        f"Бонусы: <b>{user.bonus_balance}</b>",
+        f"Визитов: <b>{visit_count}</b>",
+    ]
+
+    if last_visit:
+        days_ago = (now_salon().date() - last_visit.date()).days
+        lines.append(f"Последний визит: {last_visit.strftime('%d.%m.%Y')} ({days_ago}д назад)")
+    else:
+        lines.append("Последний визит: —")
+
+    if user.next_visit_at:
+        manual = " (ручная)" if user.next_visit_manual else " (авто)"
+        lines.append(f"Следующий визит: {user.next_visit_at.strftime('%d.%m.%Y')}{manual}")
+    else:
+        lines.append("Следующий визит: —")
+
+    if active_booking:
+        lines.append(f"\n📌 <b>Активная запись:</b> {active_booking.preferred_date} {active_booking.preferred_time}")
+
+    if recent_visits:
+        lines.append("\n📋 <b>Последние визиты:</b>")
+        for v in recent_visits:
+            svc_name = v.service.name if v.service else "Удалена"
+            date_str = v.completed_at.strftime('%d.%m.%Y') if v.completed_at else "—"
+            amount = f"{v.total_amount}₽" if v.total_amount else "—"
+            lines.append(f"  • {date_str} | {svc_name} | {amount}")
+
+    text = "\n".join(lines)
+
+    # Кнопки
+    buttons = [
+        [InlineKeyboardButton(text="💬 НАПИСАТЬ КЛИЕНТУ", url=f"tg://user?id={user.telegram_id}")],
+        [InlineKeyboardButton(text="📅 Изменить след. визит", callback_data=f"crm_edit_visit_{user.telegram_id}")],
+        [
+            InlineKeyboardButton(text="🎁 Бонусы", callback_data=f"crm_bonuses_{user.telegram_id}"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")],
+    ]
+
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.regexp(r"^crm_edit_visit_(\d+)$"))
+async def admin_crm_edit_visit(
+    callback: CallbackQuery, state: FSMContext, session: AsyncSession,
+) -> None:
+    """Запрос на редактирование даты следующего визита."""
+    tg_id = parse_callback_int(callback.data, "crm_edit_visit_")
+    if tg_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    result = await session.execute(select(User).where(User.telegram_id == tg_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        await callback.answer("Клиент не найден.", show_alert=True)
+        return
+
+    await state.update_data(crm_user_id=user.id, crm_tg_id=tg_id)
+    current = user.next_visit_at.strftime('%d.%m.%Y') if user.next_visit_at else "не задан"
+
+    await callback.message.answer(
+        f"📅 <b>Следующий визит клиента {html_escape(user.name)}</b>\n\n"
+        f"Текущий: {current}\n\n"
+        f"Введите новую дату в формате ДД.ММ.ГГГГ\n"
+        f"Или отправьте «авто» чтобы бот сам рассчитал.",
+        reply_markup=admin_back_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminCRMState.waiting_next_visit)
+    await callback.answer()
+
+
+@router.message(AdminCRMState.waiting_next_visit)
+async def admin_crm_set_next_visit(
+    message: Message, state: FSMContext, session: AsyncSession,
+) -> None:
+    """Установка даты следующего визита."""
+    data = await state.get_data()
+    user_id = data.get("crm_user_id")
+    tg_id = data.get("crm_tg_id")
+
+    if not user_id:
+        await message.answer("⚠️ Ошибка сессии. Начните заново через /admin.")
+        await state.clear()
+        return
+
+    result = await session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        await message.answer("⚠️ Клиент не найден.")
+        await state.clear()
+        return
+
+    text = message.text.strip().lower()
+
+    if text == "авто":
+        user.next_visit_manual = False
+        user.next_visit_at = None
+        await message.answer(
+            f"✅ Для {html_escape(user.name)} установлен автоматический расчёт.\n"
+            f"Дата обновится при следующем завершённом визите.",
+            parse_mode="HTML",
+        )
+    else:
+        from datetime import datetime as dt
+        try:
+            date = dt.strptime(text, '%d.%m.%Y')
+            user.next_visit_at = date
+            user.next_visit_manual = True
+            user.revisit_reminder_sent_for = None
+            await message.answer(
+                f"✅ Следующий визит {html_escape(user.name)}: <b>{text}</b> (ручная)",
+                parse_mode="HTML",
+            )
+        except ValueError:
+            await message.answer(
+                "⚠️ Неверный формат. Введите ДД.ММ.ГГГГ или «авто».",
+                reply_markup=admin_back_keyboard(),
+            )
+            return
+
+    await session.flush()
+    await state.clear()
+    await _show_client_card(message, session, user)
+
+
+# =============================================================================
+# GOOGLE SHEETS — ADMIN COMMANDS
+# =============================================================================
+
+@router.message(Command("sheets"))
+async def cmd_sheets(message: Message, session: AsyncSession) -> None:
+    """Управление Google Таблицей."""
+    await _show_sheets_menu(message, session)
+
+
+@router.callback_query(F.data == "admin_sheets")
+async def admin_sheets_callback(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Google Sheets из меню админки."""
+    await _show_sheets_menu(callback.message, session)
+    await callback.answer()
+
+
+async def _show_sheets_menu(message: Message, session: AsyncSession) -> None:
+    """Показывает меню Google Sheets."""
+    import os
+    from sqlalchemy import func as sa_func
+
+    sheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+    enabled = os.getenv("GOOGLE_SHEETS_ENABLED", "false").lower() in ("true", "1", "yes")
+
+    if not enabled:
+        await message.answer("📊 Google Sheets отключён. Установите GOOGLE_SHEETS_ENABLED=true")
+        return
+
+    text = "📊 <b>Google Sheets</b>\n\n"
+    if sheet_id:
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+        text += f"🔗 <a href=\"{url}\">Открыть таблицу</a>\n\n"
+
+    result = await session.execute(
+        select(sa_func.count(User.id)).where(User.sheets_dirty.is_(True))
+    )
+    dirty_count = result.scalar() or 0
+    text += f"📝 Ожидает синхронизации: {dirty_count}\n"
+    text += f"🔄 Автосинхронизация: каждые 5 мин\n"
+
+    buttons = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Синхронизировать сейчас", callback_data="sheets_sync_now")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")],
+    ])
+
+    await message.answer(text, reply_markup=buttons, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "sheets_sync_now")
+async def sheets_sync_now(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Принудительная синхронизация Google Sheets."""
+    await callback.answer("Синхронизация запущена...")
+
+    try:
+        from utils.google_sheets import sync_all
+        count = await sync_all(session)
+        if count < 0:
+            await callback.message.answer("⚠️ Google Sheets не настроен.")
+        elif count == 0:
+            await callback.message.answer("✅ Все данные уже синхронизированы.")
+        else:
+            await callback.message.answer(f"✅ Синхронизировано {count} клиентов.")
+    except Exception as e:
+        logger.error("Sheets sync failed: %s", e)
+        await callback.message.answer(f"❌ Ошибка синхронизации: {e}")
+
+
+# =============================================================================
+# GROK ДЛЯ АДМИНА — автоматический ответ на любое сообщение
+# =============================================================================
+
+# Хранилище истории диалогов админа с Grok (in-memory, до рестарта)
+# Dict keyed by admin_id to prevent cross-admin contamination
+_admin_grok_history: dict[int, list[dict]] = {}
+_ADMIN_GROK_MAX_HISTORY = 50
+
+
+@router.message(F.text, ~F.text.startswith("/"))
+async def admin_auto_grok(message: Message, state: FSMContext) -> None:
+    """
+    Автоматический ответ Grok на ЛЮБОЕ текстовое сообщение админа.
+    Срабатывает только когда админ НЕ в каком-то FSM-состоянии.
+    Админ не нажимает никаких кнопок — просто пишет, Grok отвечает.
+    """
+    # Только ADMIN_ID
+    if message.from_user.id != Config.ADMIN_ID:
+        return
+
+    # Если админ в каком-то FSM-состоянии — не перехватываем
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
+    admin_id = message.from_user.id
+    if admin_id not in _admin_grok_history:
+        _admin_grok_history[admin_id] = []
+
+    history = _admin_grok_history[admin_id]
+    history.append({"role": "user", "content": message.text})
+
+    # Ограничиваем историю
+    if len(history) > _ADMIN_GROK_MAX_HISTORY:
+        _admin_grok_history[admin_id] = history[-_ADMIN_GROK_MAX_HISTORY:]
+        history = _admin_grok_history[admin_id]
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    try:
+        from utils.grok import ask_grok_admin
+        response = await ask_grok_admin(history)
+        history.append({"role": "assistant", "content": response})
+
+        from utils.text_format import split_message
+        for part in split_message(response, max_len=4000):
+            await message.answer(part, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error("Admin Grok auto-reply error: %s", e)
+        await message.answer(f"❌ Grok недоступен: {e}")
+
+
+@router.message(F.photo)
+async def admin_auto_grok_photo(message: Message, state: FSMContext) -> None:
+    """Автоматический анализ фото от админа через Grok Vision."""
+    if message.from_user.id != Config.ADMIN_ID:
+        return
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    try:
+        photo = message.photo[-1]
+        file = await message.bot.get_file(photo.file_id)
+        file_bytes = await message.bot.download_file(file.file_path)
+        image_bytes = file_bytes.read()
+
+        from utils.grok import ask_grok_vision
+        caption = message.caption or "Опиши что видишь на фото"
+        response = await ask_grok_vision(image_bytes, user_text=caption)
+
+        from utils.text_format import split_message
+        for part in split_message(response, max_len=4000):
+            await message.answer(part, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error("Admin Grok photo error: %s", e)
+        await message.answer(f"❌ Ошибка анализа фото: {e}")

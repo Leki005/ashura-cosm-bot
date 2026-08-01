@@ -145,7 +145,8 @@ class TestFormatPhone:
         assert format_phone("79885919401") == "+7 (988) 591-94-01"
 
     def test_passthrough_short(self):
-        assert format_phone("123") == "123"
+        # International numbers now get + prefix
+        assert format_phone("123") == "+123"
 
 
 # =============================================================================

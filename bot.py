@@ -20,7 +20,6 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, ErrorEvent
 from aiogram.exceptions import TelegramNetworkError
-import os as _os
 from aiogram.fsm.storage.memory import MemoryStorage
 try:
     from aiogram.fsm.storage.redis import RedisStorage
@@ -98,8 +97,7 @@ async def notify_error(title: str, details: str) -> None:
         # Редактируем секреты из traceback
         import re as _re
         redacted = details
-        for secret in (Config.BOT_TOKEN, Config.XAI_API_KEY, Config.KIMI_API_KEY,
-                       Config.KIMI_PROXY, Config.SENTRY_DSN):
+        for secret in (Config.BOT_TOKEN, Config.XAI_API_KEY, Config.SENTRY_DSN):
             if secret and len(secret) > 4:
                 redacted = redacted.replace(secret, secret[:3] + "***")
         redacted = _re.sub(r'Bearer\s+\S+', 'Bearer ***REDACTED***', redacted)
@@ -319,13 +317,19 @@ async def _send_reminders_inner(bot: Bot) -> None:
                 await _send_reminder_2h(bot, session, booking)
 
         from utils.helpers import now_salon
-        await _send_post_procedure_followups(bot, session, now_salon())
 
+        # Сначала коммитим флаги напоминаний, потом followup
         await session.commit()
+
+        try:
+            await _send_post_procedure_followups(bot, session, now_salon())
+            await session.commit()
+        except Exception as e:
+            logger.warning("Ошибка post-procedure followups: %s", e)
 
 
 async def _send_post_procedure_followups(bot: Bot, session, now) -> None:
-    """Опрос клиента ~через 1 час после завершённой процедуры."""
+    """Опрос клиента ~через 7 дней после завершённой процедуры."""
     from datetime import timedelta
 
     from sqlalchemy.orm import joinedload
@@ -352,11 +356,17 @@ async def _send_post_procedure_followups(bot: Bot, session, now) -> None:
             continue
         if elapsed > max_age:
             booking.followup_sent_at = now
-            await session.flush()  # Flush сразу, не в конце
+            await session.flush()
             continue
 
         user = booking.user
         if not user:
+            continue
+
+        # Пропускаем если пользователь отключил напоминания
+        if user.revisit_reminder_disabled:
+            booking.followup_sent_at = now
+            await session.flush()
             continue
 
         from html import escape as html_esc
@@ -366,16 +376,16 @@ async def _send_post_procedure_followups(bot: Bot, session, now) -> None:
                 chat_id=user.telegram_id,
                 text=(
                     f"💫 <b>Здравствуйте, {html_esc(user.name)}!</b>\n\n"
-                    f"Прошёл примерно час после вашей процедуры:\n"
+                    f"Прошла неделя после вашей процедуры:\n"
                     f"💅 <b>{html_esc(service_name)}</b>\n\n"
-                    f"Как всё прошло? Всё ли вам понравилось?\n"
-                    f"Ваш ответ поможет Ашуре заботиться о вас ещё лучше 💛"
+                    f"Как вы себя чувствуете? Всё ли хорошо?\n\n"
+                    f"Если есть вопросы — я помогу! Если что-то срочное — сразу передам Ашуре."
                 ),
                 reply_markup=post_procedure_feedback_keyboard(booking.id),
                 parse_mode="HTML",
             )
             booking.followup_sent_at = now
-            await session.flush()  # Flush сразу после каждого успешного отправления
+            await session.flush()
             logger.info(
                 "Опрос после процедуры #%s отправлен клиенту %s",
                 booking.id, user.telegram_id,
@@ -468,8 +478,8 @@ async def _send_reviews_to_moderation_inner(bot: Bot) -> None:
         result = await session.execute(
             select(Review)
             .options(joinedload(Review.user))
-            .where(Review.is_published == False)
-            .where(Review.notified_admin == False)
+            .where(Review.is_published.is_(False))
+            .where(Review.notified_admin.is_(False))
         )
         reviews = result.scalars().unique().all()
 
@@ -538,9 +548,39 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
 
     # Инициализируем БД
     await init_db()
+
+    # Проверка целостности БД (#21)
+    try:
+        async with async_session() as _integ_session:
+            from sqlalchemy import text as _sa_text
+            result = await _integ_session.execute(_sa_text("PRAGMA integrity_check"))
+            row = result.scalar()
+            if row and row != "ok":
+                logger.warning("PRAGMA integrity_check returned: %s", row)
+            else:
+                logger.info("PRAGMA integrity_check: OK")
+    except Exception as e:
+        logger.warning("PRAGMA integrity_check failed: %s", e)
+
     async with async_session() as session:
-        await seed_data(session)
         await apply_migrations(session)
+        await seed_data(session)
+
+    # Автоматический бэкап БД (#20)
+    try:
+        import shutil
+        db_path = "bot.db"
+        backup_path = "bot.db.backup"
+        if os.path.exists(db_path):
+            shutil.copy2(db_path, backup_path)
+            # Copy WAL and SHM files for consistent backup under WAL mode
+            for suffix in ("-wal", "-shm"):
+                src = f"{db_path}{suffix}"
+                if os.path.exists(src):
+                    shutil.copy2(src, f"{backup_path}{suffix}")
+            logger.info("DB backup created: %s", backup_path)
+    except Exception as e:
+        logger.warning("DB backup failed: %s", e)
 
     # Healthcheck: БД
     if await check_db():
@@ -558,7 +598,9 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
         args=[bot],
         id="reminders",
         replace_existing=True,
-        max_instances=1,  # Защита от параллельных запусков
+        max_instances=1,
+        misfire_grace_time=3600,  # Если бот был оффлайн — выполнить в течение часа
+        coalesce=True,            # Объединить пропущенные запуски в один
     )
     scheduler.add_job(
         send_reviews_to_moderation,
@@ -567,7 +609,9 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
         args=[bot],
         id="review_moderation",
         replace_existing=True,
-        max_instances=1,  # Защита от параллельных запусков
+        max_instances=1,
+        misfire_grace_time=3600,
+        coalesce=True,
     )
     scheduler.add_job(
         PIICleanup.run_all,
@@ -578,12 +622,236 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
         id="pii_cleanup",
         replace_existing=True,
         max_instances=1,
+        misfire_grace_time=3600,
+        coalesce=True,
     )
+
+    # CRM задачи
+    from utils.crm import send_revisit_reminders, send_churn_digest
+
+    async def _crm_revisit(bot_ref=bot):
+        async with async_session() as session:
+            count = await send_revisit_reminders(bot_ref, session)
+            await session.commit()
+            if count > 0:
+                logger.info("CRM: %d revisit reminders sent", count)
+
+    async def _crm_churn(bot_ref=bot):
+        async with async_session() as session:
+            count = await send_churn_digest(bot_ref, session)
+            await session.commit()
+            if count > 0:
+                logger.info("CRM: churn digest sent (%d clients)", count)
+
+    scheduler.add_job(
+        _crm_revisit,
+        "cron",
+        hour=9,
+        minute=0,
+        id="crm_revisit_reminders",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        _crm_churn,
+        "cron",
+        hour=10,
+        minute=0,
+        id="crm_churn_digest",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # Google Sheets sync
+    async def _sheets_sync():
+        from utils.google_sheets import flush_dirty
+        async with async_session() as session:
+            count = await flush_dirty(session, limit=100)
+            await session.commit()
+            if count > 0:
+                logger.info("Google Sheets sync: %d rows", count)
+
+    try:
+        from utils.google_sheets import _get_sheets_client
+        gc, _ = _get_sheets_client()
+        if gc:
+            scheduler.add_job(
+                _sheets_sync,
+                "interval",
+                minutes=5,
+                id="sheets_sync",
+                replace_existing=True,
+                max_instances=1,
+                misfire_grace_time=300,
+                coalesce=True,
+            )
+            logger.info("Google Sheets sync enabled (every 5 min)")
+        else:
+            logger.info("Google Sheets disabled (no credentials)")
+    except Exception as e:
+        logger.info("Google Sheets not available: %s", e)
+
+    # Auto-CRM: Enhanced follow-up with Grok (7 дней)
+    async def _auto_crm_followup(bot_ref=bot):
+        from utils.auto_crm import send_enhanced_followups
+        async with async_session() as session:
+            count = await send_enhanced_followups(bot_ref, session)
+            await session.commit()
+            if count > 0:
+                logger.info("Auto-CRM: %d follow-ups sent", count)
+
+    scheduler.add_job(
+        _auto_crm_followup,
+        "cron",
+        hour=10,
+        minute=30,
+        id="auto_crm_followup",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # Auto-CRM: 3-month re-engagement (ежедневно)
+    async def _auto_crm_reengagement(bot_ref=bot):
+        from utils.auto_crm import send_reengagement_messages
+        async with async_session() as session:
+            count = await send_reengagement_messages(bot_ref, session)
+            await session.commit()
+            if count > 0:
+                logger.info("Auto-CRM: %d re-engagements sent", count)
+
+    scheduler.add_job(
+        _auto_crm_reengagement,
+        "cron",
+        hour=11,
+        minute=0,
+        id="auto_crm_reengagement",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # Автоматический сброс просроченных записей (каждые 5 мин)
+    async def _expire_old_bookings(bot_ref=bot):
+        """Помечает НЕПОДТВЕРЖДЁННЫЕ записи как expired, если время уже прошло.
+        Подтверждённые записи НЕ expire — админ явно одобрил визит."""
+        from database import Booking, User
+        from utils.helpers import now_salon, format_booking_services_line
+        from sqlalchemy.orm import joinedload
+        from sqlalchemy import update as sa_update
+
+        now = now_salon()
+        today_str = now.strftime("%d.%m.%Y")
+
+        async with async_session() as session:
+            # Ищем ТОЛЬКО pending записи, у которых дата+время уже прошли
+            # confirmed НЕ трогаем — админ подтвердил, значит визит состоится
+            result = await session.execute(
+                select(Booking)
+                .options(joinedload(Booking.user), joinedload(Booking.service))
+                .where(Booking.status == "pending")
+                .where(Booking.preferred_date.isnot(None))
+            )
+            all_bookings = result.scalars().unique().all()
+
+            expired_count = 0
+            for b in all_bookings:
+                if not b.preferred_date or not b.preferred_time:
+                    continue
+
+                try:
+                    from datetime import datetime as dt
+                    # Парсим дату и время
+                    slot_str = f"{b.preferred_date} {b.preferred_time}"
+                    slot_dt = dt.strptime(slot_str, "%d.%m.%Y %H:%M")
+                    # Если время прошло — помечаем как expired
+                    if slot_dt < now:
+                        # Атомарно меняем статус — только pending
+                        r = await session.execute(
+                            sa_update(Booking)
+                            .where(Booking.id == b.id, Booking.status == "pending")
+                            .values(status="expired")
+                        )
+                        if r.rowcount > 0:
+                            expired_count += 1
+                            logger.info("Запись #%s просрочена (%s %s), помечена expired",
+                                       b.id, b.preferred_date, b.preferred_time)
+                            # Возврат бонусов, которые клиент потратил
+                            if b.bonus_used and b.bonus_used > 0:
+                                user = b.user
+                                if user:
+                                    from sqlalchemy import update as sa_update_u
+                                    await session.execute(
+                                        sa_update_u(User).where(User.id == user.id).values(bonus_balance=User.bonus_balance + b.bonus_used)
+                                    )
+                                    from utils.helpers import add_bonus_transaction
+                                    await add_bonus_transaction(session, user.id, b.bonus_used, f'Возврат при истечении записи #{b.id}', booking_id=b.id, tx_type='REFUND')
+                                    b.bonus_used = 0
+                            # Уведомляем клиента
+                            try:
+                                tg_id = b.user.telegram_id if b.user else None
+                                if tg_id:
+                                    svc_name = format_booking_services_line(b)
+                                    await bot_ref.send_message(
+                                        chat_id=tg_id,
+                                        text=(
+                                            f"⏰ <b>Запись истекла</b>\n\n"
+                                            f"💅 {svc_name}\n"
+                                            f"📅 {b.preferred_date} {b.preferred_time}\n\n"
+                                            f"Время записи прошло. Если хотите записаться снова — "
+                                            f"нажмите /start"
+                                        ),
+                                        parse_mode="HTML",
+                                    )
+                            except Exception as e:
+                                logger.warning("Не удалось уведомить о просрочке %s: %s", tg_id, e)
+                except (ValueError, TypeError):
+                    continue
+
+            if expired_count > 0:
+                await session.commit()
+                logger.info("Просрочено %d записей", expired_count)
+
+    scheduler.add_job(
+        _expire_old_bookings,
+        "interval",
+        minutes=5,
+        id="expire_old_bookings",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=300,
+        coalesce=True,
+    )
+
     scheduler.start()
-    logger.info("Шедулер запущен: напоминания (5 мин), модерация отзывов (2 мин), PII cleanup (вс 3:00).")
+    logger.info("Шедулер запущен: напоминания (5 мин), модерация отзывов (2 мин), PII cleanup (вс 3:00), CRM revisit (9:00), CRM churn (10:00), Auto-CRM followup (10:30), Auto-CRM reengagement (11:00), Expire bookings (5 мин).")
 
     # Уведомляем админа о запуске
     logger.info("=== БОТ ГОТОВ К РАБОТЕ ===")
+
+
+async def _acquire_instance_lock(redis_client) -> bool:
+    """Acquire a Redis-based lock to prevent multiple bot instances."""
+    import hashlib
+    token_hash = hashlib.sha256(Config.BOT_TOKEN.encode()).hexdigest()[:16]
+    lock_key = f"bot:poll_lock:{token_hash}"
+    try:
+        ok = await redis_client.set(lock_key, "1", ex=30, nx=True)
+        if not ok:
+            holder = await redis_client.get(lock_key)
+            logger.error("Another bot instance is running (lock holder: %s). Exiting.", holder)
+            return False
+        logger.info("Instance lock acquired: %s", lock_key)
+        return True
+    except Exception as e:
+        logger.warning("Could not acquire instance lock: %s", e)
+        return True  # Proceed if lock check fails (don't block on Redis errors)
 
 
 async def on_shutdown(bot: Bot, dispatcher: Dispatcher) -> None:
@@ -591,10 +859,18 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher) -> None:
     global scheduler, _error_bot
     logger.info("=== БОТ ОСТАНАВЛИВАЕТСЯ ===")
 
-    # Останавливаем шедулер
+    # Останавливаем шедулер ПЕРВЫМ — чтобы задачи не писали в закрывающиеся соединения
     if scheduler:
-        scheduler.shutdown()
+        scheduler.shutdown(wait=True)
         logger.info("Шедулер остановлен.")
+
+    # Закрываем Redis FSM storage ПОСЛЕ шедулера
+    if _REDIS_AVAILABLE and hasattr(dispatcher.storage, 'redis'):
+        try:
+            await dispatcher.storage.close()
+            logger.info("Redis FSM storage закрыт.")
+        except Exception as e:
+            logger.warning("Ошибка закрытия Redis: %s", e)
 
     # Закрываем соединения с БД
     from database import engine
@@ -606,11 +882,6 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher) -> None:
     if grok_module._grok_session is not None and not grok_module._grok_session.closed:
         await grok_module._grok_session.close()
         logger.info("Grok HTTP-сессия закрыта.")
-
-    # Закрываем HTTP-сессию Kimi API
-    from utils import kimi as kimi_module
-    await kimi_module.close_kimi_session()
-    logger.info("Kimi HTTP-сессия закрыта.")
 
     _error_bot = None
 
@@ -677,18 +948,30 @@ async def main() -> None:
 
     # Создаём диспетчер с FSM
         # FSM storage: Redis if available, MemoryStorage as fallback
-    redis_url = _os.getenv('REDIS_URL', '')
+    redis_url = os.getenv('REDIS_URL', '')
+    storage = None
+    _redis_client = None
     if redis_url and _REDIS_AVAILABLE:
         try:
-            storage = RedisStorage.from_url(redis_url, ttl=Config.FSM_TTL_MINUTES * 60)
-            logger.info('FSM storage: Redis (%s), TTL=%d min', redis_url, Config.FSM_TTL_MINUTES)
+            storage = RedisStorage.from_url(
+                redis_url,
+                state_ttl=Config.FSM_TTL_MINUTES * 60,
+                data_ttl=Config.FSM_TTL_MINUTES * 60,
+            )
+            # Ping для проверки соединения
+            _redis_client = storage.redis
+            await _redis_client.ping()
+            logger.info('FSM storage: Redis (%s), TTL=%d min', redis_url.split('@')[-1], Config.FSM_TTL_MINUTES)
+            # Set Redis client for distributed AI limits
+            from utils import grok as grok_module
+            grok_module.set_redis_client(_redis_client)
         except Exception as e:
             if Config.REQUIRE_REDIS:
                 logger.error('Redis REQUIRED but unavailable: %s', e)
                 sys.exit(1)
             logger.warning('Redis unavailable (%s), falling back to MemoryStorage', e)
-            storage = MemoryStorage()
-    else:
+            storage = None
+    if storage is None:
         if Config.REQUIRE_REDIS:
             logger.error('REQUIRE_REDIS=1 but no REDIS_URL set')
             sys.exit(1)
@@ -701,9 +984,17 @@ async def main() -> None:
     async def on_error(event: ErrorEvent) -> bool:
         """Ловит все необработанные исключения и уведомляет ERROR_NOTIFY_ID."""
         exception = event.exception
+        if 'query is too old' in str(exception):
+            return True  # Suppress silently — stale callback queries are harmless
         tb = "".join(
             __import__("traceback").format_exception(type(exception), exception, exception.__traceback__)
         )
+
+        # Redis connection failures — log warning, show friendly message
+        _exc_name = type(exception).__name__.lower()
+        if "redis" in _exc_name or "connection" in _exc_name and "redis" in tb.lower():
+            logger.warning("Redis FSM error (will auto-recover): %s", exception)
+
         logger.error("Необработанная ошибка: %s\n%s", exception, tb)
         await notify_error("Необработанная ошибка", tb)
         # Отправляем клиенту честное сообщение об ошибке
@@ -733,6 +1024,12 @@ async def main() -> None:
     dp.include_router(ai_consultant.router)
     dp.include_router(skin_anamnesis.router)
     dp.include_router(client.router)
+
+    # Single-instance lock via Redis
+    if _redis_client:
+        if not await _acquire_instance_lock(_redis_client):
+            logger.error("Another bot instance detected. Shutting down.")
+            sys.exit(1)
 
     # Обработчики жизненного цикла
     dp.startup.register(on_startup)

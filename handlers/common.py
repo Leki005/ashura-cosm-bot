@@ -8,14 +8,14 @@
 """
 
 import logging
-from datetime import datetime, timezone
-from collections import defaultdict
+from datetime import datetime
 from html import escape as html_escape
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Contact, Message
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import Config
@@ -24,6 +24,7 @@ from keyboards import main_menu_keyboard, restart_confirm_keyboard
 from utils.helpers import (
     get_active_booking,
     get_user_by_telegram_id,
+    now_salon,
     validate_name,
     validate_phone,
 )
@@ -33,6 +34,15 @@ from utils.states import RegistrationState, ReviewState
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+# =============================================================================
+# Block group/supergroup messages — bot works only in private chats
+# =============================================================================
+
+@router.message(F.chat.type != "private")
+async def _block_group_messages(message: Message) -> None:
+    return
 
 
 # =============================================================================
@@ -128,6 +138,29 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) 
         show_consent_for_registration,
     )
 
+    # АДМИН: мгновенный доступ к админ-панели, без регистрации и согласия
+    from handlers.admin import is_admin
+    if await is_admin(message.from_user.id):
+        # Гарантируем что админ есть в БД (для уведомлений и прочего)
+        user = await get_user_by_telegram_id(session, message.from_user.id)
+        if not user:
+            from database import User as UserModel
+            user = UserModel(
+                telegram_id=message.from_user.id,
+                name=message.from_user.full_name or "Админ",
+                phone="",
+                pd_consent_at=now_salon(),
+            )
+            session.add(user)
+            await session.flush()
+        from keyboards import admin_main_keyboard
+        await message.answer(
+            f"🔐 <b>Админ-панель {Config.SALON_NAME}</b>\n\nВыберите раздел:",
+            reply_markup=admin_main_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
     user = await get_user_by_telegram_id(session, message.from_user.id)
 
     if user:
@@ -138,17 +171,6 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) 
             return
         # Existing user with consent — try deep link first
         if payload and await _dispatch_deep_link(message, state, session, user, payload):
-            return
-
-        # Админ — сразу админ-панель
-        from handlers.admin import is_admin
-        if await is_admin(message.from_user.id):
-            from keyboards import admin_main_keyboard
-            await message.answer(
-                f"🔐 <b>Админ-панель {Config.SALON_NAME}</b>\n\nВыберите раздел:",
-                reply_markup=admin_main_keyboard(),
-                parse_mode="HTML",
-            )
             return
 
         await show_client_home(
@@ -295,7 +317,23 @@ async def finish_registration(
             pd_consent_version=Config.PRIVACY_POLICY_VERSION,
         )
         session.add(user)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        # Concurrent /start — пользователь уже создан параллельным запросом
+        await session.rollback()
+        existing = await get_user_by_telegram_id(session, message.from_user.id)
+        if existing:
+            existing.name = name
+            existing.phone = phone
+            existing.pd_consent_at = consent_at
+            existing.pd_consent_version = Config.PRIVACY_POLICY_VERSION
+            user = existing
+            await session.flush()
+        else:
+            logger.error("finish_registration: IntegrityError but user not found tg_id=%s", message.from_user.id)
+            await message.answer("⚠️ Ошибка регистрации. Попробуйте /start снова.")
+            return
     await log_pd_consent(session, user, consented_at=consent_at)
 
     logger.info(
@@ -358,7 +396,7 @@ async def cmd_help(message: Message, session: AsyncSession, state: FSMContext) -
         f"<b>💅 Услуги и цены</b> — Полный каталог с описанием\n\n"
         f"<b>✨ Подбор ухода с ИИ</b> — Анкета по коже + анализ фото\n\n"
         f"<b>🤖 Помощник ИИ</b> — Задайте вопрос ИИ-консультанту\n\n"
-        f"<b>🎁 Бонусы</b> — {Config.BONUS_PERCENT}% бонусов при подтверждении записи\n\n"
+        f"<b>🎁 Бонусы</b> — Скидка за лояльность: 0% → 3% → 5%\n\n"
         f"<b>❓ Контакты и FAQ</b> — Адрес, телефон, частые вопросы\n\n"
         f"<b>★ Отзывы</b> — Оставьте отзыв или почитайте другие\n\n"
         f"<b>/menu</b> — вернуться в главное меню в любой момент\n\n"
@@ -465,3 +503,10 @@ async def restart_confirm(callback: CallbackQuery, state: FSMContext) -> None:
 async def restart_cancel(callback: CallbackQuery) -> None:
     """Отмена рестарта — остаёмся в текущем состоянии."""
     await callback.answer("Остаёмся. Запись не изменена.", show_alert=True)
+
+
+@router.callback_query(F.data == "crm_no_remind")
+async def crm_no_remind(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Клиент нажал 'Не напоминать' в CRM-напоминании."""
+    from utils.crm import handle_no_remind
+    await handle_no_remind(callback, session)

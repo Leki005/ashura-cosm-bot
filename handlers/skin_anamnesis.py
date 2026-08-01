@@ -5,10 +5,9 @@
 
 import json
 import logging
-from datetime import datetime, timezone
 from html import escape as html_escape
 
-from aiogram import Bot, F, Router
+from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -31,19 +30,17 @@ from keyboards import (
     SKIN_TYPE_CHOICES,
     skin_areas_keyboard,
     skin_continue_keyboard,
-    skin_final_keyboard,
     skin_goals_keyboard,
     skin_home_care_keyboard,
     skin_pro_care_keyboard,
     skin_problems_keyboard,
     skin_skip_keyboard,
-    skin_start_keyboard,
-    skin_why_keyboard,
 )
 from utils.grok import GrokAPIError, ask_grok_vision
 from utils.helpers import get_user_by_telegram_id
 from utils.states import SkinAnamnesisState
 from utils.text_format import split_message
+from utils.ui_helpers import progress_bar, cb_ack
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +75,7 @@ async def _safe_edit_markup(message: Message, markup) -> None:
 
 
 def _progress(q: int) -> str:
-    pct = round((q - 1) / TOTAL_QUESTIONS * 100)
-    return f"📋 <b>Вопрос {q} из {TOTAL_QUESTIONS}</b> • Прогресс: {pct}%\n"
+    return progress_bar(q, TOTAL_QUESTIONS)
 
 
 def _skin_inflammation_keyboard() -> InlineKeyboardMarkup:
@@ -198,6 +194,9 @@ async def skin_why(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "skin_go")
 async def skin_start(callback: CallbackQuery, state: FSMContext) -> None:
+    # NOTE: FSM TTL is global (Config.FSM_TTL_MINUTES=30). aiogram doesn't support
+    # per-state TTL overrides. If anamnesis takes >30 min, state expires and user
+    # must restart. 30 min is sufficient for the ~5-7 min questionnaire.
     await state.set_state(SkinAnamnesisState.in_progress)
     await state.update_data(skin_q=1, skin_answers={}, skin_selected=[])
     await _ask_question(callback.message, state)
@@ -218,10 +217,22 @@ async def skin_restart(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+_Q_KEYS = {
+    1: "age", 2: "skin_type", 3: "condition", 4: "problems", 5: "problem_areas",
+    6: "duration", 7: "inflammation", 8: "home_care", 9: "pro_care",
+    10: "allergy", 11: "goals", 12: "budget",
+}
+
+
 @router.callback_query(SkinAnamnesisState.in_progress, F.data == "skin_next")
 async def skin_next(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     q = data.get("skin_q", 1)
+    answers = data.get("skin_answers", {})
+    key = _Q_KEYS.get(q)
+    if key and key not in answers:
+        await callback.answer("Сначала ответьте на вопрос!", show_alert=True)
+        return
     await state.update_data(skin_q=q + 1, skin_selected=[])
     await _ask_question(callback.message, state)
     await callback.answer()
@@ -391,14 +402,19 @@ async def handle_problems(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         if val == "none":
             selected = {"none"}
+            await cb_ack(callback, "select")
         elif "none" in selected:
             selected.discard("none")
             selected.add(val)
+            await cb_ack(callback, "select")
+        elif val in selected:
+            selected.discard(val)
+            await cb_ack(callback, "remove")
         else:
-            selected.discard(val) if val in selected else selected.add(val)
+            selected.add(val)
+            await cb_ack(callback, "select")
         await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_problems_keyboard(selected))
-    await callback.answer()
 
 
 # =============================================================================
@@ -431,10 +447,14 @@ async def handle_areas(callback: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(skin_q=6)
         await _ask_question(callback.message, state)
     else:
-        selected.discard(val) if val in selected else selected.add(val)
+        if val in selected:
+            selected.discard(val)
+            await cb_ack(callback, "remove")
+        else:
+            selected.add(val)
+            await cb_ack(callback, "select")
         await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_areas_keyboard(selected))
-    await callback.answer()
 
 
 # =============================================================================
@@ -538,14 +558,19 @@ async def handle_home_care(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         if val == "nothing":
             selected = {"nothing"}
+            await cb_ack(callback, "select")
         elif "nothing" in selected:
             selected.discard("nothing")
             selected.add(val)
+            await cb_ack(callback, "select")
+        elif val in selected:
+            selected.discard(val)
+            await cb_ack(callback, "remove")
         else:
-            selected.discard(val) if val in selected else selected.add(val)
+            selected.add(val)
+            await cb_ack(callback, "select")
         await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_home_care_keyboard(selected))
-    await callback.answer()
 
 
 # =============================================================================
@@ -587,14 +612,19 @@ async def handle_pro_care(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         if val == "nothing":
             selected = {"nothing"}
+            await cb_ack(callback, "select")
         elif "nothing" in selected:
             selected.discard("nothing")
             selected.add(val)
+            await cb_ack(callback, "select")
+        elif val in selected:
+            selected.discard(val)
+            await cb_ack(callback, "remove")
         else:
-            selected.discard(val) if val in selected else selected.add(val)
+            selected.add(val)
+            await cb_ack(callback, "select")
         await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_pro_care_keyboard(selected))
-    await callback.answer()
 
 
 # =============================================================================
@@ -656,10 +686,14 @@ async def handle_goals(callback: CallbackQuery, state: FSMContext) -> None:
         # Сразу к бюджету
         await message_answer_budget(callback.message)
     else:
-        selected.discard(val) if val in selected else selected.add(val)
+        if val in selected:
+            selected.discard(val)
+            await cb_ack(callback, "remove")
+        else:
+            selected.add(val)
+            await cb_ack(callback, "select")
         await state.update_data(skin_selected=list(selected))
         await _safe_edit_markup(callback.message, skin_goals_keyboard(selected))
-    await callback.answer()
 
 
 async def message_answer_budget(message: Message) -> None:
@@ -849,10 +883,17 @@ async def handle_skip_text(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(SkinAnamnesisState.waiting_text, F.text)
 async def handle_text_input(message: Message, state: FSMContext) -> None:
+    # Пропускаем команды к common-хендлерам (/start, /restart, /menu, /help)
+    if message.text and message.text.startswith("/"):
+        return
     data = await state.get_data()
     field = data.get("skin_text_field")
     answers = data.get("skin_answers", {})
     text = message.text.strip()
+
+    if len(text) > 500:
+        await message.answer('Слишком длинный текст. Максимум 500 символов.')
+        return
 
     if field == "allergy_details":
         answers["allergy_details"] = text
@@ -896,8 +937,30 @@ def _choice_keyboard(choices: list[tuple[str, str]], prefix: str):
 # =============================================================================
 
 async def _show_final(message: Message, state: FSMContext, session: AsyncSession, telegram_id: int = 0) -> None:
+    import asyncio
+
     data = await state.get_data()
     answers = data.get("skin_answers", {})
+
+    # Анимация завершения — 3 кадра
+    anim = await message.answer("✨ <b>Собираю результаты...</b>", parse_mode="HTML")
+    await asyncio.sleep(0.6)
+    try:
+        await anim.edit_text("✨🧬 <b>Анализирую ответы...</b>", parse_mode="HTML")
+    except Exception:
+        pass
+    await asyncio.sleep(0.6)
+    try:
+        await anim.edit_text(
+            "✅ <b>Анамнез собран!</b>\n"
+            "├─ 🧬 Тип кожи определён\n"
+            "├─ 📍 Зоны отмечены\n"
+            "└─ 🎯 Цели зафиксированы",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await asyncio.sleep(0.8)
 
     report = _build_report(answers)
     await message.answer(report, parse_mode="HTML")

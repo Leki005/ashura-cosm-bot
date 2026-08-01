@@ -86,6 +86,9 @@ class TestAnamnesisKeyboardToken:
         kb = anamnesis_keyboard(0, {}, anam_token="abc123")
         for row in kb.inline_keyboard:
             for btn in row:
+                # Skip special callbacks like anam_skip_all
+                if btn.callback_data == "anam_skip_all":
+                    continue
                 assert btn.callback_data.startswith("anam_abc123_"), (
                     f"Expected 'anam_abc123_' prefix, got '{btn.callback_data}'"
                 )
@@ -103,7 +106,7 @@ class TestAnamnesisKeyboardToken:
                 # The next part should be a known question key, not a token
                 known_keys = {"allergy", "pregnancy", "anticoagulants", "herpes",
                               "inflammation", "scars", "recent_procedures",
-                              "diabetes", "oncology", "epilepsy"}
+                              "diabetes", "oncology", "epilepsy", "skip"}
                 first_segment = after_prefix.split("_")[0]
                 assert first_segment in known_keys, (
                     f"Expected question key after 'anam_', got '{first_segment}'"

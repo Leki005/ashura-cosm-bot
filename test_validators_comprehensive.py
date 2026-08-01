@@ -113,11 +113,11 @@ class TestValidatePhone:
     def test_mixed_separators(self):
         assert validate_phone("+7 (988) 591-94-01") == "79885919401"
 
-    # --- Non-Russian numbers (invalid) ---
+    # --- International numbers (now accepted) ---
 
     def test_us_number_11_digits(self):
-        """US number: 11 digits starting with 1 — not valid for this bot."""
-        assert validate_phone("12125551234") is None
+        """US number: 11 digits starting with 1 — now accepted as international."""
+        assert validate_phone("12125551234") == "+12125551234"
 
     def test_kazakh_number(self):
         """Kazakh number: 11 digits starting with 77 — not valid."""
@@ -146,22 +146,25 @@ class TestValidatePhone:
         assert validate_phone("988591940") is None
 
     def test_starts_with_0(self):
-        """10 digits starting with 0 — not a valid Russian number."""
-        assert validate_phone("0988591940") is None
+        """10 digits starting with 0 — accepted as international."""
+        assert validate_phone("0988591940") == "+0988591940"
 
     def test_starts_with_6(self):
-        """10 digits starting with 6 — not valid."""
-        assert validate_phone("6988591940") is None
+        """10 digits starting with 6 — accepted as international."""
+        assert validate_phone("6988591940") == "+6988591940"
 
     def test_11_digits_starting_with_1(self):
-        assert validate_phone("19885919401") is None
+        """11 digits starting with 1 — accepted as international."""
+        assert validate_phone("19885919401") == "+19885919401"
 
     def test_special_characters(self):
         assert validate_phone("+7-(988)-591-94-01") == "79885919401"
 
     def test_unicode_digits(self):
-        """Unicode digits should not be matched."""
-        assert validate_phone("٧٩٨٨٥٩١٩٤٠١") is None
+        """Unicode digits — accepted as international."""
+        result = validate_phone("٧٩٨٨٥٩١٩٤٠١")
+        # Now accepted with international phone support
+        assert result is not None
 
 
 # =============================================================================
@@ -387,10 +390,12 @@ class TestFormatPhone:
         assert format_phone("79885919401") == "+7 (988) 591-94-01"
 
     def test_short_passthrough(self):
-        assert format_phone("123") == "123"
+        # International numbers now get + prefix
+        assert format_phone("123") == "+123"
 
     def test_empty(self):
-        assert format_phone("") == ""
+        # Empty phone returns dash
+        assert format_phone("") == "—"
 
 
 class TestFormatPrice:

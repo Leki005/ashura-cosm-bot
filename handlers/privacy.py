@@ -4,7 +4,7 @@
 """
 
 import logging
-from datetime import datetime, timezone
+
 from html import escape as html_escape
 from typing import Any, Awaitable, Callable
 
@@ -52,7 +52,7 @@ class PrivacyConsentMiddleware:
         user_event = event.event
         tg_user = getattr(user_event, "from_user", None)
         if not tg_user or tg_user.is_bot:
-            return await handler(event, data)
+            return  # Block bots, don't pass through
 
         if tg_user.id in _ADMIN_IDS:
             return await handler(event, data)
@@ -279,6 +279,19 @@ async def privacy_revoke(callback: CallbackQuery, session: AsyncSession) -> None
         await callback.answer("Согласие уже отозвано.", show_alert=True)
         return
 
+    # Audit trail ДО анонимизации (152-ФЗ: фиксируем факт и время отзыва)
+    # НЕ логируем PII (имя, телефон) — это нарушает принцип минимизации данных
+    try:
+        from utils.audit import log_admin_action
+        log_admin_action(
+            user.telegram_id,
+            "PDN_REVOKED",
+            target=f"user:{user.telegram_id}",
+            details="consent_revoked_pending_anonymization",
+        )
+    except Exception as e:
+        logger.warning("PDN audit log failed: %s", e)
+
     user.pd_consent_at = None
     user.pd_consent_version = None
     # Очищаем ВСЕ анамнезы — нужно проходить заново
@@ -349,11 +362,11 @@ async def privacy_revoke(callback: CallbackQuery, session: AsyncSession) -> None
             .values(bonus_used=0)
         )
 
-    # Анонимизируем отзывы (152-ФЗ)
+    # Анонимизируем отзывы (152-ФЗ) — снимаем с публикации, чтобы пустой текст не отображался
     from database import Review
     await session.execute(
         sa_update(Review).where(Review.user_id == user.id)
-        .values(text=None)
+        .values(text=None, is_published=False)
     )
 
     # Анонимизируем логи согласия (152-ФЗ: минимизация хранения)
@@ -364,6 +377,25 @@ async def privacy_revoke(callback: CallbackQuery, session: AsyncSession) -> None
     )
 
     await session.flush()
+
+    # Google Sheets cleanup — удаляем строку клиента
+    try:
+        from utils.google_sheets import delete_client_row
+        await delete_client_row(user.telegram_id)
+    except Exception as e:
+        logger.debug("Sheets cleanup failed: %s", e)
+
+    # Лог ПОСЛЕ успешной анонимизации (подтверждение завершения)
+    try:
+        from utils.audit import log_admin_action
+        log_admin_action(
+            user.telegram_id,
+            "PDN_ANONYMIZED_OK",
+            target=f"user:{user.telegram_id}",
+            details=f"active_bookings_cancelled={_active_count} bonus_refunded={total_refunded}",
+        )
+    except Exception as e:
+        logger.warning("PDN completion audit failed: %s", e)
 
     # Уведомляем админа об отзыве согласия
     try:

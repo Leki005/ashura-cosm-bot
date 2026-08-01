@@ -52,9 +52,17 @@ class Config:
     INSTAGRAM_LINK: str = "https://www.instagram.com/ashuracosm"
 
     # --- Бонусная система ---
-    BONUS_PERCENT: int = 3           # Процент бонусов
+    BONUS_PERCENT: int = 3           # Процент бонусов (для совместимости)
     BONUS_MIN_AMOUNT: int = 20000    # Минимальная сумма для начисления
     BONUS_MAX_DISCOUNT_PERCENT: int = 50  # Максимальная скидка бонусами (%)
+
+    # --- Скидка за лояльность ---
+    # Скидка растёт с количеством завершённых визитов
+    LOYALTY_DISCOUNT_TIERS: list[tuple[int, int]] = [
+        (0, 0),    # 0 визитов (новый клиент) → 0%
+        (1, 3),    # 1-2 визита → 3%
+        (3, 5),    # 3+ визитов → 5%
+    ]
 
     # --- Запись: минимум минут до приёма (сегодня) ---
     BOOKING_MIN_LEAD_MINUTES: int = 15
@@ -63,8 +71,9 @@ class Config:
     CANCEL_DEADLINE_HOURS: int = int(os.getenv("CANCEL_DEADLINE_HOURS", "2"))
 
     # --- Напоминания ---
-    FOLLOWUP_AFTER_HOURS: int = 1    # Опрос после процедуры (через N часов)
-    FOLLOWUP_MAX_AGE_HOURS: int = 48 # Не спрашивать, если визит был давно
+    # --- Post-procedure follow-up ---
+    FOLLOWUP_AFTER_HOURS: int = 168    # Опрос после процедуры (через 7 дней = 168 часов)
+    FOLLOWUP_MAX_AGE_HOURS: int = 336  # Не спрашивать, если прошло больше 14 дней
 
     # --- База данных (в Docker: sqlite+aiosqlite:////app/data/bot.db) ---
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./bot.db")
@@ -104,15 +113,8 @@ class Config:
     AI_DAILY_LIMIT_PER_USER: int = int(os.getenv("AI_DAILY_LIMIT_PER_USER", "30"))
     AI_MAX_CONCURRENT: int = int(os.getenv("AI_MAX_CONCURRENT", "3"))
 
-    # --- Kimi K3 API ---
-    KIMI_API_KEY: str = os.getenv("KIMI_API_KEY", "")
-    KIMI_MODEL: str = os.getenv("KIMI_MODEL", "kimi-k3")
-    KIMI_BASE_URL: str = os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
-    KIMI_PROXY: str = os.getenv("KIMI_PROXY", "socks5://127.0.0.1:10808")
-    KIMI_TIMEOUT: int = int(os.getenv("KIMI_TIMEOUT", "300"))
-
     # --- Технические ---
-    FSM_TTL_MINUTES: int = 10        # Время жизни FSM-состояния
+    FSM_TTL_MINUTES: int = 30        # Время жизни FSM-состояния (booking/anamnesis может занять >10 мин)
     THROTTLE_RATE: float = 1.0       # 1 сообщение в секунду
 
     # --- Redis fail-hard ---
@@ -132,4 +134,19 @@ class Config:
             errors.append("BOT_TOKEN не задан в .env!")
         if cls.ADMIN_ID == 0:
             errors.append("ADMIN_ID не задан в .env!")
+        if not cls.XAI_API_KEY:
+            errors.append("XAI_API_KEY не задан — ИИ-консультант не будет работать!")
+        # Security warnings
+        if not cls.PROXY_SSL_VERIFY:
+            import logging
+            logging.getLogger(__name__).warning(
+                "PROXY_SSL_VERIFY=false — SSL verification disabled. "
+                "This is needed for Reality proxy but exposes API calls to MITM risk."
+            )
+        if not cls.REQUIRE_REDIS:
+            import logging
+            logging.getLogger(__name__).warning(
+                "REQUIRE_REDIS=false — FSM will use MemoryStorage. "
+                "State will be lost on restart. Set REQUIRE_REDIS=true for production."
+            )
         return errors

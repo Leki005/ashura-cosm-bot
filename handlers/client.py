@@ -114,6 +114,13 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+
+# Block group/supergroup messages — bot works only in private chats
+@router.message(F.chat.type != "private")
+async def _block_group_messages(message: Message) -> None:
+    return
+
+
 # Double-submit guard: tracks users currently in _finalize_booking
 _finalizing_users: set[int] = set()
 
@@ -160,7 +167,7 @@ async def _ask_booking_date(message: Message, state: FSMContext) -> None:
     """Шаг выбора даты записи."""
     data = await state.get_data()
     proc = data.get("booking_service_name", "")
-    proc_line = f"💅 Процедура: <b>{proc}</b>\n\n" if proc else ""
+    proc_line = f"💅 Процедура: <b>{html_escape(proc)}</b>\n\n" if proc else ""
     await message.answer(
         f"{proc_line}"
         "📅 Выберите желаемую дату записи\n"
@@ -179,7 +186,7 @@ async def _proceed_after_anamnesis(
     preset = data.get("booking_service_name")
     if preset:
         await message.answer(
-            f"💅 Сейчас выбрано: <b>{preset}</b>\n"
+            f"💅 Сейчас выбрано: <b>{html_escape(preset)}</b>\n"
             f"Можете подтвердить или выбрать другую процедуру:",
             parse_mode="HTML",
         )
@@ -190,6 +197,13 @@ async def _start_general_booking(
     message: Message, state: FSMContext, session: AsyncSession, user: User,
 ) -> None:
     """Новая общая заявка — анамнез (если устарел) или сразу выбор процедуры."""
+    # Блокируем запись для админа
+    if user.telegram_id in (Config.ADMIN_ID, Config.OWNER_ID):
+        await message.answer(
+            "⛔ Вы администратор — записывайте клиентов через админ-панель (/admin)."
+        )
+        return
+
     import secrets
     await _hide_quick_commands(message)
     anam_token = secrets.token_hex(8)  # 16 hex chars — инвалидирует старые кнопки
@@ -212,9 +226,11 @@ async def _start_general_booking(
         await _proceed_after_anamnesis(message, state, session, user)
         return
 
+    kb = anamnesis_keyboard(0, {}, anam_token=anam_token)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_fsm")])
     await message.answer(
         build_anamnesis_message(0, {}),
-        reply_markup=anamnesis_keyboard(0, {}, anam_token=anam_token),
+        reply_markup=kb,
     )
     await state.set_state(AnamnesisState.in_progress)
 
@@ -241,11 +257,13 @@ async def _start_service_booking(
         )
         if max_discount > 0:
             await _hide_quick_commands(message)
+            kb = use_bonuses_keyboard(service.price, user.bonus_balance)
+            kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_fsm")])
             await message.answer(
                 f"🎁 У вас {user.bonus_balance} бонусов!\n"
                 f"Скидка на {service.name} ({format_price(service.price)})\n\n"
                 f"Максимум: {format_price(max_discount)}",
-                reply_markup=use_bonuses_keyboard(service.price, user.bonus_balance),
+                reply_markup=kb,
             )
             await state.set_state(BookingState.waiting_bonus_amount)
             return
@@ -255,7 +273,7 @@ async def _start_service_booking(
         await _hide_quick_commands(message)
         await message.answer(
             f"📋 Анкета актуальна.\n"
-            f"Запись на: <b>{service.name}</b>\n"
+            f"Запись на: <b>{html_escape(service.name)}</b>\n"
             f"Цена: {format_price(service.price)}",
             parse_mode="HTML",
         )
@@ -266,11 +284,13 @@ async def _start_service_booking(
     anam_token = secrets.token_hex(8)
     await state.update_data(anam_token=anam_token)
     await _hide_quick_commands(message)
+    kb = anamnesis_keyboard(0, {}, anam_token=anam_token)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_fsm")])
     await message.answer(
         f"Запись на: {service.name}\n"
         f"Цена: {format_price(service.price)}\n\n"
         f"{build_anamnesis_message(0, {})}",
-        reply_markup=anamnesis_keyboard(0, {}, anam_token=anam_token),
+        reply_markup=kb,
     )
     await state.set_state(AnamnesisState.in_progress)
 
@@ -282,6 +302,11 @@ async def _start_service_booking(
 @router.callback_query(F.data == "menu_booking")
 async def menu_booking(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
     """Начало записи — анамнез или выбор при активной записи."""
+    # Блокируем запись для админа
+    if callback.from_user.id in (Config.ADMIN_ID, Config.OWNER_ID):
+        await callback.answer("⛔ Вы администратор — записывайте клиентов через админ-панель.", show_alert=True)
+        return
+
     user = await get_user_by_telegram_id(session, callback.from_user.id)
     if not user:
         await callback.answer("Сначала пройдите регистрацию: /start", show_alert=True)
@@ -307,6 +332,16 @@ async def menu_booking(callback: CallbackQuery, state: FSMContext, session: Asyn
 @router.callback_query(AnamnesisState.in_progress, F.data.startswith("anam_"))
 async def anamnesis_answer(callback: CallbackQuery, state: FSMContext) -> None:
     """Обрабатывает ответы анамнеза (ДА/НЕТ)."""
+    # Пропуск анкеты — делегируем в отдельный хендлер
+    if callback.data == "anam_skip_all":
+        await anamnesis_skip_all(callback, state)
+        return
+
+    # Ответы из режима "пропустить анкету" — тоже отдельный хендлер
+    if callback.data.startswith("anam_skipans_"):
+        await anamnesis_skip_answer(callback, state)
+        return
+
     data = await state.get_data()
     answers = data.get("anamnesis", {})
     current_index = data.get("anam_index", 0)
@@ -392,6 +427,174 @@ async def show_anamnesis_summary(message: Message, answers: dict) -> None:
     for i, chunk in enumerate(chunks):
         markup = anamnesis_summary_keyboard() if i == len(chunks) - 1 else None
         await message.answer(chunk, reply_markup=markup)
+
+
+
+@router.message(AnamnesisState.in_progress, F.text)
+async def anamnesis_text_message(message: Message, state: FSMContext) -> None:
+    """Клиент пишет текст во время анамнеза — Grok подключается и спрашивает обязательное."""
+    if message.text in ("/start", "/restart", "/menu"):
+        return
+
+    data = await state.get_data()
+    answers = data.get("anamnesis", {})
+
+    mandatory_keys = ["allergy", "menstruation"]
+    missing = [k for k in mandatory_keys if k not in answers]
+
+    answered_info = []
+    for q_text, q_key in ANAMNESIS_QUESTIONS:
+        if q_key in answers:
+            status = "да" if answers[q_key] else "нет"
+            answered_info.append(f"{q_text}: {status}")
+
+    context = "\n".join(answered_info) if answered_info else "Пока не ответил ни на один вопрос"
+
+    prompt = (
+        f"Ты — помощник косметолога Ашуры. Клиент начал заполнять анкету перед процедурой, "
+        f"но вместо ответов на вопросы написал сообщение.\n\n"
+        f"Текущие ответы клиента:\n{context}\n\n"
+        f"Сообщение клиента: «{message.text}»\n\n"
+        f"Твоя задача:\n"
+        f"1. Вежливо ответить на сообщение клиента\n"
+        f"2. Обязательно спросить про аллергию и менструацию (если не отвечены)\n"
+        f"3. Попросить ответить на вопросы кнопками выше\n"
+        f"4. Не повторять вопросы которые уже отвечены\n\n"
+    )
+
+    if missing:
+        missing_texts = []
+        for q_text, q_key in ANAMNESIS_QUESTIONS:
+            if q_key in missing:
+                missing_texts.append(q_text)
+        prompt += f"ОБЯЗАТЕЛЬНО спроси: {', '.join(missing_texts)}\n"
+
+    prompt += "Отвечай кратко, дружелюбно, на русском. Не используй HTML-теги."
+
+    try:
+        from utils.grok import ask_grok
+        response = await ask_grok(
+            history=[{"role": "user", "content": prompt}],
+            system_prompt="Ты — помощник косметолога. Отвечай кратко, дружелюбно, на русском.",
+            user_id=message.from_user.id,
+        )
+        await message.answer(response)
+    except Exception as e:
+        logger.warning("Grok anamnesis engagement error: %s", e)
+        if "allergy" in missing:
+            await message.answer(
+                "⚠️ Прежде чем продолжить — ответьте пожалуйста:\n\n"
+                "👉 <b>Есть ли у вас аллергия на косметику?</b>\n"
+                "Используйте кнопки выше ☝️",
+                parse_mode="HTML",
+            )
+        elif "menstruation" in missing:
+            await message.answer(
+                "⚠️ Ещё один важный вопрос:\n\n"
+                "👉 <b>Сейчас менструация?</b>\n"
+                "Используйте кнопки выше ☝️",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                "📋 Пожалуйста, ответьте на вопросы анкеты кнопками выше ☝️\n"
+                "После завершения мы продолжим запись.",
+            )
+
+
+@router.callback_query(AnamnesisState.in_progress, F.data == "anam_skip_all")
+async def anamnesis_skip_all(callback: CallbackQuery, state: FSMContext) -> None:
+    """Пропуск анамнеза — Grok спрашивает только обязательное."""
+    data = await state.get_data()
+    answers = data.get("anamnesis", {})
+
+    mandatory = {"allergy": "аллергия на косметику", "menstruation": "менструация сейчас"}
+    missing = {k: v for k, v in mandatory.items() if k not in answers}
+
+    if not missing:
+        await state.set_state(AnamnesisState.completed)
+        await show_anamnesis_summary(callback.message, answers)
+        await callback.answer()
+        return
+
+    questions = ", ".join(missing.values())
+    prompt = (
+        f"Ты — помощник косметолога Ашуры. Клиент хочет пропустить анкету, "
+        f"но нам нужно узнать: {questions}.\n\n"
+        f"Спроси об этом кратко и дружелюбно."
+    )
+
+    try:
+        from utils.grok import ask_grok
+        response = await ask_grok(
+            history=[{"role": "user", "content": prompt}],
+            system_prompt="Ты — помощник косметолога. Кратко, дружелюбно, на русском.",
+            user_id=callback.from_user.id,
+        )
+        await callback.message.answer(response)
+    except Exception:
+        await callback.message.answer(
+            f"📋 Нужно ответить на пару вопросов:\n\n"
+            + "\n".join(f"• {v}?" for v in missing.values()),
+        )
+
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    for q_key, q_text in missing.items():
+        builder.row(
+            InlineKeyboardButton(text=f"✅ Нет — {q_text}", callback_data=f"anam_skipans_{q_key}_no"),
+            InlineKeyboardButton(text=f"⚠️ Да — {q_text}", callback_data=f"anam_skipans_{q_key}_yes"),
+        )
+    await callback.message.answer("Выберите:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(AnamnesisState.in_progress, F.data.startswith("anam_skipans_"))
+async def anamnesis_skip_answer(callback: CallbackQuery, state: FSMContext) -> None:
+    """Ответ на обязательный вопрос из режима 'пропустить анкету'."""
+    data = await state.get_data()
+    answers = data.get("anamnesis", {})
+
+    stripped = callback.data.removeprefix("anam_skipans_")
+    if stripped.endswith("_yes"):
+        key = stripped.removesuffix("_yes")
+        answer = True
+    elif stripped.endswith("_no"):
+        key = stripped.removesuffix("_no")
+        answer = False
+    else:
+        await callback.answer()
+        return
+
+    answers[key] = answer
+
+    mandatory = ["allergy", "menstruation"]
+    all_answered = all(k in answers for k in mandatory)
+
+    if all_answered:
+        # Все обязательные отвечены — заполняем остальные как "нет" и завершаем
+        for q_text, q_key in ANAMNESIS_QUESTIONS:
+            if q_key not in answers:
+                answers[q_key] = False
+        await state.update_data(anamnesis=answers, anam_index=len(ANAMNESIS_QUESTIONS))
+        await state.set_state(AnamnesisState.completed)
+        await show_anamnesis_summary(callback.message, answers)
+    else:
+        # Показываем следующий обязательный вопрос
+        await state.update_data(anamnesis=answers)
+        next_missing = [k for k in mandatory if k not in answers]
+        if next_missing:
+            next_key = next_missing[0]
+            q_text = next(qt for qt, qk in ANAMNESIS_QUESTIONS if qk == next_key)
+            from aiogram.utils.keyboard import InlineKeyboardBuilder
+            builder = InlineKeyboardBuilder()
+            builder.row(
+                InlineKeyboardButton(text=f"✅ Нет — {q_text}", callback_data=f"anam_skipans_{next_key}_no"),
+                InlineKeyboardButton(text=f"⚠️ Да — {q_text}", callback_data=f"anam_skipans_{next_key}_yes"),
+            )
+            await callback.message.answer(q_text, reply_markup=builder.as_markup())
+
+    await callback.answer()
 
 
 # =============================================================================
@@ -498,6 +701,16 @@ async def booking_edit_time(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "booking_back_to_procedures")
+async def booking_back_to_procedures(callback: CallbackQuery, state: FSMContext) -> None:
+    """Возврат к выбору процедуры из любого шага."""
+    await state.set_state(BookingState.waiting_procedure)
+    await _ask_procedure_selection(callback.message, state)
+    await callback.answer()
+
+
+
+
 async def _ask_booking_time(message: Message, state: FSMContext, date_str: str) -> None:
     """Запрашивает время после выбора даты."""
     ok, err = check_booking_date_allowed(date_str)
@@ -507,10 +720,20 @@ async def _ask_booking_time(message: Message, state: FSMContext, date_str: str) 
         return
 
     await state.update_data(preferred_date=date_str)
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    keyboard = booking_time_keyboard(date_str)
+    # Добавляем кнопку листа ожидания
+    waitlist_btn = InlineKeyboardButton(
+        text="📋 Встать в лист ожидания",
+        callback_data=f"waitlist_join_{date_str}",
+    )
+    if hasattr(keyboard, 'inline_keyboard'):
+        keyboard.inline_keyboard.append([waitlist_btn])
     await message.answer(
         f"📅 Дата: <b>{date_str}</b>\n\n"
-        "⏰ Выберите время или напишите (например: 14:00):",
-        reply_markup=booking_time_keyboard(date_str),
+        "⏰ Выберите время или напишите (например: 14:00):\n"
+        "Если нет удобного времени — встаньте в лист ожидания.",
+        reply_markup=keyboard,
         parse_mode="HTML",
     )
     await state.set_state(BookingState.waiting_time)
@@ -667,12 +890,12 @@ async def _finalize_booking(
         tg_username = actor_username if actor_username is not None else message.from_user.username
         data = await state.get_data()
 
-        await state.clear()
-
+        # НЕ очищаем state до успешной валидации — иначе при ошибке теряются данные wizard'а
         preferred_date = data.get("preferred_date")
         preferred_time = data.get("preferred_time")
 
         if not preferred_date or not preferred_time:
+            await state.clear()  # Очищаем только при фатальной ошибке
             await message.answer(
                 "⚠️ Не указаны дата или время. Начните запись заново.",
                 reply_markup=back_to_main_keyboard(),
@@ -681,10 +904,37 @@ async def _finalize_booking(
 
         ok, err = check_booking_time_allowed(preferred_date, preferred_time)
         if not ok:
+            # НЕ очищаем state — пользователь может выбрать другое время
             await message.answer(
                 f"⚠️ {err}\n\nВыберите дату и время заново.",
                 reply_markup=back_to_main_keyboard(),
             )
+            return
+
+        # Проверка конфликта расписания
+        from utils.google_sheets import check_schedule_conflict
+        has_conflict, conflict_desc = await check_schedule_conflict(
+            session, preferred_date, preferred_time,
+        )
+        if has_conflict:
+            await message.answer(
+                f"⚠️ <b>Конфликт расписания!</b>\n\n{conflict_desc}\n\n"
+                f"Выберите другое время.",
+                reply_markup=back_to_main_keyboard(),
+                parse_mode="HTML",
+            )
+            # Уведомляем админа о конфликте
+            try:
+                await message.bot.send_message(
+                    chat_id=Config.ADMIN_ID,
+                    text=f"🚨 <b>Конфликт расписания!</b>\n\n"
+                         f"Клиент пытается записаться на {preferred_date} {preferred_time},\n"
+                         f"но на это время уже есть запись.\n\n"
+                         f"{conflict_desc}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
             return
 
         # user ищем по ID клиента (для callback «Пропустить» — actor_telegram_id)
@@ -721,12 +971,16 @@ async def _finalize_booking(
         bonus_used = data.get("bonus_used", 0)
 
         if bonus_used > 0:
-            # Серверная валидация: баланс + лимит 50%
+            # Серверная валидация: баланс + лимит 50% от полной цены (основная + доп. услуги)
             if service_id:
                 svc_check = await session.execute(select(Service).where(Service.id == service_id))
                 svc_obj = svc_check.scalar_one_or_none()
                 if svc_obj:
-                    max_by_percent = svc_obj.price * Config.BONUS_MAX_DISCOUNT_PERCENT // 100
+                    total_price = svc_obj.price
+                    # Добавляем цены доп. услуг (merge)
+                    for extra in data.get("extra_services", []):
+                        total_price += int(extra.get("price") or 0)
+                    max_by_percent = total_price * Config.BONUS_MAX_DISCOUNT_PERCENT // 100
                     bonus_used = min(bonus_used, max_by_percent)
             # Атомарное списание бонусов (защита от race condition)
             from sqlalchemy import update
@@ -757,19 +1011,26 @@ async def _finalize_booking(
         try:
             await session.flush()  # booking.id доступен после flush; commit сделает middleware
         except IntegrityError:
+            await session.rollback()  # Явный rollback — не полагаемся на middleware
             await message.answer(
                 "⚠️ У вас уже есть активная запись. Дождитесь её завершения.",
                 reply_markup=back_to_main_keyboard(),
             )
             return
 
+        # Сброс счётчика CRM-напоминаний при новой записи
+        from utils.crm import reset_reminder_on_booking
+        await reset_reminder_on_booking(session, user.id)
+
         if bonus_used > 0:
+            from database import BonusTransaction
             await add_bonus_transaction(
                 session,
                 user.id,
                 -bonus_used,
                 f"Списание бонусов при записи #{booking.id}",
                 booking_id=booking.id,
+                tx_type=BonusTransaction.TX_SPEND,
             )
 
         await session.refresh(booking)
@@ -869,6 +1130,101 @@ async def booking_notes_message(
         return
 
     await _finalize_booking(message, state, session, notes=notes)
+
+
+# =============================================================================
+# ЛИСТ ОЖИДАНИЯ
+# =============================================================================
+
+@router.callback_query(F.data.startswith("waitlist_join_"))
+async def waitlist_join(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Клиент встаёт в лист ожидания на дату."""
+    date_str = callback.data.replace("waitlist_join_", "")
+    if not date_str:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    user = await get_user_by_telegram_id(session, callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала пройдите регистрацию: /start", show_alert=True)
+        return
+
+    data = await callback.message.bot.get_chat(callback.message.chat.id)
+    service_id = None  # Можно расширить для конкретной услуги
+
+    from utils.waiting_and_reminders import add_to_waiting_list
+    entry = await add_to_waiting_list(session, user.id, service_id, date_str)
+    if entry:
+        await callback.message.answer(
+            f"✅ Вы добавлены в лист ожидания на <b>{date_str}</b>.\n\n"
+            f"Как только освободится слот — я сразу сообщу!\n"
+            f"Если передумали — просто запишитесь на другую дату через /start",
+            parse_mode="HTML",
+        )
+    else:
+        await callback.message.answer(
+            f"📋 Вы уже в листе ожидания на <b>{date_str}</b>.",
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("waitlist_take_"))
+async def waitlist_take(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Клиент забирает свободный слот из листа ожидания."""
+    parts = callback.data.split("_")
+    if len(parts) < 5:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    entry_id = int(parts[2])
+    date_str = parts[3]
+    time_str = parts[4]
+
+    user = await get_user_by_telegram_id(session, callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+
+    # Проверяем нет ли уже активной записи
+    active = await get_active_booking(session, user.id)
+    if active:
+        await callback.answer("У вас уже есть активная запись!", show_alert=True)
+        return
+
+    from utils.waiting_and_reminders import mark_slot_taken
+    taken = await mark_slot_taken(session, entry_id)
+    if not taken:
+        await callback.answer("Этот слот уже занят.", show_alert=True)
+        return
+
+    # Сохраняем данные для создания записи
+    from aiogram.fsm.context import FSMContext
+    from aiogram.fsm.storage.base import StorageKey
+    key = StorageKey(bot_id=callback.bot.id, chat_id=callback.message.chat.id, user_id=callback.from_user.id)
+    state = FSMContext(storage=callback.bot.storage, key=key)
+    await state.update_data(preferred_date=date_str, preferred_time=time_str, from_waitlist=True)
+
+    await callback.message.answer(
+        f"🎉 Отлично! Слот ваш: <b>{date_str}</b> в <b>{time_str}</b>\n\n"
+        f"Теперь выберите услугу:",
+        reply_markup=services_categories_keyboard(),
+        parse_mode="HTML",
+    )
+    await state.set_state(BookingState.waiting_procedure)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("waitlist_skip_"))
+async def waitlist_skip(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Клиент пропускает свободный слот."""
+    entry_id = int(callback.data.replace("waitlist_skip_", ""))
+    from utils.waiting_and_reminders import mark_slot_skipped
+    await mark_slot_skipped(session, entry_id)
+    await callback.answer("Хорошо, слот передан следующему.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -1110,13 +1466,15 @@ async def merge_confirm(
 
     # Общая заявка без конкретной услуги — показываем выбор процедур
     await state.update_data(merge_booking_id=booking_id)
+    kb = booking_procedure_keyboard()
+    kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_fsm")])
     await callback.message.answer(
         f"🔗 <b>Добавить к записи #{booking_id}</b>\n\n"
         f"Текущие услуги: {format_booking_services_line(booking)}\n"
         f"📅 {booking.preferred_date or '—'}, "
         f"⏰ {booking.preferred_time or '—'}\n\n"
         "💅 Выберите процедуру для добавления:",
-        reply_markup=booking_procedure_keyboard(),
+        reply_markup=kb,
         parse_mode="HTML",
     )
     await state.set_state(BookingState.waiting_merge_procedure)
@@ -1238,18 +1596,30 @@ async def merge_procedure_custom(
     service_id, name = await resolve_procedure_service(
         session, "other", message.text.strip(),
     )
-    svc_result = await session.execute(
-        select(Service).where(Service.id == service_id)
-    )
-    service = svc_result.scalar_one_or_none()
-    if not service:
-        await message.answer("Услуга не найдена.")
-        return
 
-    merged = await merge_service_into_booking(session, booking, service)
-    if not merged:
-        await message.answer("Эта услуга уже есть в вашей записи.")
-        return
+    if service_id is not None:
+        svc_result = await session.execute(
+            select(Service).where(Service.id == service_id)
+        )
+        service = svc_result.scalar_one_or_none()
+    else:
+        service = None
+
+    if service:
+        merged = await merge_service_into_booking(session, booking, service)
+        if not merged:
+            await message.answer("Эта услуга уже есть в вашей записи.")
+            return
+    else:
+        # Кастомная процедура — добавляем в заметки к записи
+        extra = booking.extra_services_json or "[]"
+        try:
+            extras = json.loads(extra)
+        except (json.JSONDecodeError, TypeError):
+            extras = []
+        extras.append({"name": name, "price": 0})
+        booking.extra_services_json = json.dumps(extras, ensure_ascii=False)
+        await session.flush()
 
     await session.refresh(booking)
 
@@ -1294,6 +1664,10 @@ async def merge_note_text(
         return
 
     user = await get_user_by_telegram_id(session, message.from_user.id)
+    if not user:
+        await message.answer("Пользователь не найден. Попробуйте /start")
+        await state.clear()
+        return
     result = await session.execute(
         select(Booking)
         .options(joinedload(Booking.service))
@@ -1392,7 +1766,7 @@ async def process_bonus_amount(
 ) -> None:
     """Обрабатывает выбор количества бонусов."""
     amount = parse_callback_int(callback.data, "bonus_use_")
-    if amount is None or amount <= 0:
+    if amount is None or amount < 0:  # amount == 0 = "не использовать бонусы"
         await callback.answer("Ошибка данных.", show_alert=True)
         return
 
@@ -1425,7 +1799,7 @@ async def process_bonus_amount(
         await _hide_quick_commands(callback.message)
         await callback.message.answer(
             f"📋 Анкета актуальна.\n"
-            f"Запись на: {service.name}\n"
+            f"Запись на: {html_escape(service.name)}\n"
             f"Цена: {format_price(service.price)}{bonus_text}",
         )
         await _proceed_after_anamnesis(callback.message, state, session, user)
@@ -1543,7 +1917,7 @@ async def followup_text_start(
 async def followup_question(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession,
 ) -> None:
-    """Вопрос после процедуры — переводим в консультацию."""
+    """Вопрос после процедуры — AI отвечает за Ашуру."""
     booking_id = parse_callback_int(callback.data, "followup_question_")
     if booking_id is None:
         await callback.answer("Ошибка данных.", show_alert=True)
@@ -1561,23 +1935,203 @@ async def followup_question(
     except Exception:
         pass
 
+    await callback.message.answer(
+        "❓ Задайте ваш вопрос — я помогу!\n\n"
+        "Можно написать текст или отправить фото.\n"
+        "Если что-то срочное — нажмите «🚨 Срочно / осложнения».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚨 Срочно / осложнения", callback_data=f"followup_urgent_{booking_id}")],
+            [InlineKeyboardButton(text="🔙 В меню", callback_data="menu_main")],
+        ]),
+    )
+    await state.set_state(PostProcedureState.waiting_question)
+    await state.update_data(followup_booking_id=booking_id)
+    await callback.answer()
+
+
+@router.message(PostProcedureState.waiting_question, F.text)
+async def followup_question_text(
+    message: Message, state: FSMContext, session: AsyncSession,
+) -> None:
+    """Вопрос клиента после процедуры — AI отвечает, срочное → Ашуре."""
+    from utils.grok import ask_grok, GrokAPIError
+
+    data = await state.get_data()
+    booking_id = data.get("followup_booking_id")
+    if not booking_id:
+        await message.answer("⚠️ Сессия истекла. Напишите через «FAQ / Консультация».")
+        await state.clear()
+        return
+
+    booking = await _get_completed_booking(session, booking_id, message.from_user.id)
+    if not booking:
+        await message.answer("⚠️ Запись не найдена.")
+        await state.clear()
+        return
+
+    user_text = message.text.strip()
+    service_name = format_booking_services_line(booking)
+
+    # Проверяем на срочность
+    urgent_keywords = ["сроочно", "помогите", "осложнение", "аллергия", "отёк", "воспаление",
+                        "больно", "кровотеч", "гной", "температура", "плохо", "ужасно",
+                        "emergency", "help", "urgent", "осложнени"]
+    is_urgent = any(kw in user_text.lower() for kw in urgent_keywords)
+
+    if is_urgent:
+        # Срочно → сразу Ашуре
+        try:
+            from utils.helpers import notify_admin_procedure_feedback
+            await notify_admin_procedure_feedback(
+                message.bot, booking, booking.user,
+                f"🚨 СРОЧНО после процедуры «{service_name}»: {html_escape(user_text)}",
+            )
+        except Exception as e:
+            logger.error("Ошибка уведомления админа: %s", e)
+
+        await message.answer(
+            "🚨 Поняла вас! Передаю Ашуре срочно.\n\n"
+            "Ашура свяжется с вами в ближайшее время.\n"
+            "Если очень плохо — вызовите скорую: 103",
+            reply_markup=back_to_main_keyboard(),
+        )
+        await state.clear()
+        return
+
+    # Обычный вопрос → AI отвечает
+    await message.bot.send_chat_action(message.chat.id, "typing")
+
+    system_prompt = (
+        "Ты — помощник косметолога Ашуры из Астрахани. "
+        "Клиент задаёт вопрос после процедуры. "
+        "ОТВЕЧАЙ ТОЛЬКО на простые вопросы об уходе после процедуры (умывание, макияж, солнце, спорт). "
+        "НЕ ставь диагнозы. НЕ называй конкретные препараты. НЕ давай медицинские советы. "
+        "Если вопрос касается боли, отёка, покраснения, аллергии, осложнений — ОБЯЗАТЕЛЬНО скажи "
+        "обратиться к Ашуре или вызвать скорую. Не пытайся лечить. "
+        "Отвечай кратко (2-3 предложения), тепло, на русском. "
+        "В конце ВСЕГДА добавляй: 'Для точной консультации обратитесь к Ашуре.' "
+        f"Процедура клиента: {service_name}."
+    )
+
+    try:
+        reply = await ask_grok(
+            [{"role": "user", "content": user_text}],
+            user_id=message.from_user.id,
+            system_prompt=system_prompt,
+        )
+
+        # Логируем ответ ИИ для контроля
+        logger.info("AI_ANSWER to user=%s after procedure '%s': %s",
+                     message.from_user.id, service_name, reply[:200])
+
+        safe_reply = html_escape(reply)
+
+        # Отправляем копию админу для контроля
+        try:
+            await message.bot.send_message(
+                chat_id=Config.ADMIN_ID,
+                text=(
+                    f"🤖 <b>AI ответил клиенту</b>\n\n"
+                    f"👤 {html_escape(booking.user.name)}\n"
+                    f"💅 {html_escape(service_name)}\n\n"
+                    f"<b>Вопрос:</b> {html_escape(user_text)}\n\n"
+                    f"<b>Ответ AI:</b>\n{html_escape(reply[:500])}"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass  # Не критично если админ не получил
+
+        await message.answer(
+            f"💬 {safe_reply}\n\n"
+            f"<i>Если хотите уточнить — просто напишите ещё.\n"
+            f"Для срочных вопросов нажмите «🚨 Срочно / осложнения»</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚨 Срочно / осложнения", callback_data=f"followup_urgent_{booking_id}")],
+                [InlineKeyboardButton(text="🔄 Задать ещё вопрос", callback_data=f"followup_ask_again_{booking_id}")],
+                [InlineKeyboardButton(text="✅ Спасибо, всё понятно", callback_data="menu_main")],
+            ]),
+            parse_mode="HTML",
+        )
+        # Сбрасываем FSM — иначе каждое сообщение = "вопрос после процедуры"
+        await state.clear()
+    except GrokAPIError as e:
+        logger.warning("Grok error in followup: %s", e)
+        await message.answer(
+            "⚠️ Не удалось получить ответ. Передаю Ашуре.\n\n"
+            "Ашура ответит вам в ближайшее время!",
+            reply_markup=back_to_main_keyboard(),
+        )
+        # Fallback → админу
+        try:
+            from utils.helpers import notify_admin_procedure_feedback
+            await notify_admin_procedure_feedback(
+                message.bot, booking, booking.user,
+                f"❓ Вопрос после «{service_name}» (AI не ответил): {html_escape(user_text)}",
+            )
+        except Exception:
+            pass
+        await state.clear()
+
+
+@router.callback_query(F.data.regexp(r"^followup_urgent_(\d+)$"))
+async def followup_urgent(
+    callback: CallbackQuery, session: AsyncSession,
+) -> None:
+    """Срочно / осложнения — сразу Ашуре."""
+    booking_id = parse_callback_int(callback.data, "followup_urgent_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    booking = await _get_completed_booking(
+        session, booking_id, callback.from_user.id,
+    )
+    if not booking:
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+
     service_name = format_booking_services_line(booking)
     try:
+        from utils.helpers import notify_admin_procedure_feedback
         await notify_admin_procedure_feedback(
-            callback.bot,
-            booking,
-            booking.user,
-            f"❓ Есть вопрос после процедуры «{service_name}»",
+            callback.bot, booking, booking.user,
+            f"🚨 СРОЧНО: клиент нажал «Срочно / осложнения» после процедуры «{service_name}»",
         )
     except Exception as e:
-        logger.warning("Не удалось уведомить админа: %s", e)
+        logger.error("Ошибка уведомления админа: %s", e)
 
-    await callback.message.answer(
-        "❓ Задайте ваш вопрос Ашуре:\n"
-        "можно написать текст или отправить фото.",
-        reply_markup=cancel_fsm_kb,
+    await callback.message.edit_text(
+        "🚨 Поняла вас! Передаю Ашуре срочно.\n\n"
+        "Ашура свяжется с вами в ближайшее время.\n"
+        "Если очень плохо — вызовите скорую: 103",
+        reply_markup=None,
     )
-    await state.set_state(ConsultationState.waiting_question)
+    await callback.answer("Передано Ашуре!")
+    logger.info("URGENT followup: client %s after procedure %s", callback.from_user.id, booking_id)
+
+
+@router.callback_query(F.data.regexp(r"^followup_ask_again_(\d+)$"))
+async def followup_ask_again(
+    callback: CallbackQuery, state: FSMContext, session: AsyncSession,
+) -> None:
+    """Клиент хочет задать ещё один вопрос после процедуры."""
+    booking_id = parse_callback_int(callback.data, "followup_ask_again_")
+    if booking_id is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    booking = await _get_completed_booking(session, booking_id, callback.from_user.id)
+    if not booking:
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    await state.set_state(PostProcedureState.waiting_question)
+    await state.update_data(followup_booking_id=booking_id)
+    await callback.message.answer(
+        "❓ Задайте ваш вопрос — я помогу!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚨 Срочно / осложнения", callback_data=f"followup_urgent_{booking_id}")],
+            [InlineKeyboardButton(text="🔙 В меню", callback_data="menu_main")],
+        ]),
+    )
     await callback.answer()
 
 
@@ -1691,11 +2245,13 @@ async def review_rating(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.update_data(rating=rating)
 
+    kb = review_skip_text_keyboard()
+    kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_fsm")])
     await callback.message.answer(
         f"{'★' * rating} — Спасибо!\n\n"
         f"Напишите текст отзыва (необязательно):\n"
         f"Что понравилось? Результат, атмосфера?",
-        reply_markup=review_skip_text_keyboard(),
+        reply_markup=kb,
     )
     await state.set_state(ReviewState.waiting_text)
     await callback.answer()
@@ -1706,12 +2262,18 @@ async def review_skip_text(callback: CallbackQuery, state: FSMContext, session: 
     """Пропуск текстового отзыва — сохраняет или обновляет."""
     data = await state.get_data()
     edit_review_id = data.get("edit_review_id")
+    rating = data.get("rating")
+    if not rating:
+        await callback.message.answer("Сессия истекла. Оцените процедуру заново.")
+        await state.clear()
+        await callback.answer()
+        return
 
     if edit_review_id:
         result = await session.execute(select(Review).where(Review.id == edit_review_id))
         review = result.scalar_one_or_none()
         if review:
-            review.rating = data["rating"]
+            review.rating = rating
             await session.flush()
             await callback.message.answer(
                 "✅ Отзыв обновлён!",
@@ -1732,12 +2294,17 @@ async def review_text(message: Message, state: FSMContext, session: AsyncSession
     """Получает текст отзыва — сохраняет или обновляет."""
     data = await state.get_data()
     edit_review_id = data.get("edit_review_id")
+    rating = data.get("rating")
+    if not rating:
+        await message.answer("Сессия истекла. Оцените процедуру заново.")
+        await state.clear()
+        return
 
     if edit_review_id:
         result = await session.execute(select(Review).where(Review.id == edit_review_id))
         review = result.scalar_one_or_none()
         if review:
-            review.rating = data["rating"]
+            review.rating = rating
             review.text = message.text
             await session.flush()
             await message.answer(
@@ -1783,7 +2350,9 @@ async def save_review(
 ) -> Review:
     """Сохраняет отзыв в БД. Возвращает объект Review."""
     data = await state.get_data()
-    rating = data["rating"]
+    rating = data.get("rating")
+    if not rating:
+        raise ValueError("rating missing from state")
 
     result = await session.execute(select(User).where(User.telegram_id == telegram_id))
     user = result.scalar_one_or_none()
@@ -1817,6 +2386,10 @@ async def review_edit_start(callback: CallbackQuery, state: FSMContext, session:
 
     if not review:
         await callback.answer("Отзыв не найден.", show_alert=True)
+        return
+
+    if review.is_published:
+        await callback.answer("Нельзя редактировать опубликованный отзыв.", show_alert=True)
         return
 
     user = await get_user_by_telegram_id(session, callback.from_user.id)
@@ -1862,10 +2435,12 @@ async def review_edit_rating(callback: CallbackQuery, state: FSMContext) -> None
         return
     await state.update_data(rating=rating)
 
+    kb = review_skip_text_keyboard()
+    kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_fsm")])
     await callback.message.answer(
         f"{'★' * rating}\n\n"
         f"Напишите новый текст отзыва (или нажмите «Пропустить»):",
-        reply_markup=review_skip_text_keyboard(),
+        reply_markup=kb,
     )
     await state.set_state(ReviewState.waiting_text)
     await callback.answer()
@@ -2058,6 +2633,7 @@ async def consult_photo_received(
         await message.answer("Сначала пройдите регистрацию: /start")
         return
 
+    forward_ok = False
     try:
         info_text = (
             f"📸 Фото от клиента для консультации\n\n"
@@ -2073,15 +2649,22 @@ async def consult_photo_received(
         await message.forward(chat_id=Config.owner_id())
         if Config.owner_id() != Config.ADMIN_ID:
             await message.forward(chat_id=Config.ADMIN_ID)
+        forward_ok = True
     except Exception as e:
         logger.error("Ошибка пересылки фото: %s", e)
 
-    await message.answer(
-        f"✅ Фото отправлено Ашуре!\n\n"
-        f"Она изучит и даст рекомендации.\n"
-        f"Если хотите отправить ещё — нажмите «📸 Фото для консультации» снова.",
-        reply_markup=consult_after_keyboard(),
-    )
+    if forward_ok:
+        await message.answer(
+            f"✅ Фото отправлено Ашуре!\n\n"
+            f"Она изучит и даст рекомендации.\n"
+            f"Если хотите отправить ещё — нажмите «📸 Фото для консультации» снова.",
+            reply_markup=consult_after_keyboard(),
+        )
+    else:
+        await message.answer(
+            f"⚠️ Не удалось отправить фото. Попробуйте позже или напишите Ашуре напрямую.",
+            reply_markup=consult_after_keyboard(),
+        )
     await state.clear()
 
 
@@ -2135,7 +2718,7 @@ async def menu_bonuses(callback: CallbackQuery, session: AsyncSession) -> None:
         f"🎁 Бонусная программа\n\n"
         f"💰 Ваш баланс: {user.bonus_balance} бонусов\n\n"
         f"Как это работает:\n"
-        f"• При подтверждении записи — {Config.BONUS_PERCENT}% бонусов (скидка)\n"
+        f"• Скидка за лояльность: 0 визитов → 0%, 1-2 → 3%, 3+ → 5%\n"
         f"• Бонусами до {Config.BONUS_MAX_DISCOUNT_PERCENT}% скидки при записи\n\n"
         f"💫 Копите бонусы и экономьте!",
         reply_markup=bonuses_menu_keyboard(user.bonus_balance),
@@ -2321,7 +2904,7 @@ async def cancel_booking_start(
 
 @router.callback_query(F.data.startswith("cancel_confirm_"))
 async def cancel_booking_confirm(
-    callback: CallbackQuery, session: AsyncSession,
+    callback: CallbackQuery, session: AsyncSession, state: FSMContext,
 ) -> None:
     """Подтверждённая отмена — статус cancelled сохраняется в БД (commit в middleware)."""
     booking_id = parse_callback_int(callback.data, "cancel_confirm_")
@@ -2373,12 +2956,14 @@ async def cancel_booking_confirm(
             .values(bonus_balance=User.bonus_balance + booking.bonus_used)
         )
         await session.refresh(user)
+        from database import BonusTransaction
         await add_bonus_transaction(
             session,
             user.id,
             booking.bonus_used,
             f"Возврат бонусов при отмене записи #{booking_id}",
             booking_id=booking_id,
+            tx_type=BonusTransaction.TX_REFUND,
         )
         booking.bonus_used = 0
 
@@ -2388,8 +2973,8 @@ async def cancel_booking_confirm(
     conf_tx_result = await session.execute(
         sa_select(BonusTransaction).where(
             BonusTransaction.booking_id == booking_id,
+            BonusTransaction.tx_type == BonusTransaction.TX_CONFIRM_BONUS,
             BonusTransaction.amount > 0,
-            BonusTransaction.description.contains("при подтверждении"),
         )
     )
     conf_tx = conf_tx_result.scalar_one_or_none()
@@ -2402,12 +2987,14 @@ async def cancel_booking_confirm(
             .values(bonus_balance=sa_func.max(0, User.bonus_balance - conf_tx.amount))
         )
         await session.refresh(user)
+        from database import BonusTransaction
         await add_bonus_transaction(
             session,
             user.id,
             -conf_tx.amount,
             f"Отзыв бонуса при отмене записи #{booking_id}",
             booking_id=booking_id,
+            tx_type=BonusTransaction.TX_REVOKE,
         )
 
     # Подгружаем услугу для уведомления админу
@@ -2429,6 +3016,7 @@ async def cancel_booking_confirm(
         "Теперь вы можете записаться заново!",
         reply_markup=back_to_main_keyboard(),
     )
+    await state.clear()
     await callback.answer()
 
 
@@ -2473,6 +3061,6 @@ async def ai_auto_help(message: Message, state: FSMContext, session: AsyncSessio
         return
 
     await message.answer(
-        "Используйте кнопки меню для навигации 👇",
+        "Сессия истекла. Нажмите /start для начала.",
         reply_markup=main_menu_keyboard(),
     )

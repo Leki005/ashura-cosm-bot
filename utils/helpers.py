@@ -68,8 +68,8 @@ PROCEDURE_PRESETS: dict[str, str] = {
 # THROTTLING (защита от спама)
 # =============================================================================
 
-# Хранилище последних сообщений: {user_id: timestamp}
-_last_message_time: dict[int, datetime] = {}
+# Хранилище последних сообщений: {user_id: monotonic_timestamp}
+_last_message_time: dict[int, float] = {}
 _THROTTLE_CLEANUP_INTERVAL = 300  # Очистка каждые 5 минут
 _THROTTLE_MAX_ENTRIES = 10000  # Максимум пользователей в памяти
 _last_throttle_cleanup: float = 0
@@ -122,16 +122,28 @@ async def throttled_message(message: Message) -> None:
 def validate_phone(phone: str) -> Optional[str]:
     """
     Нормализует и валидирует номер телефона.
+    Принимает российские и международные номера.
     Возвращает нормализованный номер или None если невалидный.
     """
-    # Убираем всё кроме цифр
-    digits = "".join(c for c in phone if c.isdigit())
+    # Убираем всё кроме цифр и +
+    cleaned = phone.strip()
+    digits = "".join(c for c in cleaned if c.isdigit())
 
     # Российский номер: 11 цифр начиная с 7 или 8
     if len(digits) == 11 and digits[0] in "78":
         return "7" + digits[1:]  # Нормализуем к формату 79XXXXXXXXX
     if len(digits) == 10 and digits[0] == "9":
         return "7" + digits
+
+    # Международный номер: начинается с + или 00, 10-15 цифр
+    if cleaned.startswith("+") and 10 <= len(digits) <= 15:
+        return "+" + digits
+    if cleaned.startswith("00") and 10 <= len(digits) <= 15:
+        return "+" + digits
+
+    # Международный номер без + (но с кодом страны, 10-15 цифр)
+    if 10 <= len(digits) <= 15 and not digits.startswith("7"):
+        return "+" + digits
 
     return None
 
@@ -326,12 +338,17 @@ def format_date_from_callback(yyyymmdd: str) -> str:
     """Преобразует 20260715 → 15.07.2026."""
     from datetime import datetime
 
-    parsed = datetime.strptime(yyyymmdd, "%Y%m%d")
-    return parsed.strftime("%d.%m.%Y")
+    try:
+        parsed = datetime.strptime(yyyymmdd, "%Y%m%d")
+        return parsed.strftime("%d.%m.%Y")
+    except (ValueError, TypeError):
+        return yyyymmdd or ""
 
 
 def format_time_from_callback(hhmm: str) -> str:
     """Преобразует 1430 → 14:30."""
+    if not hhmm or len(hhmm) < 2:
+        return hhmm or ""
     return f"{hhmm[:2]}:{hhmm[2:4]}"
 
 
@@ -341,10 +358,17 @@ def format_time_from_callback(hhmm: str) -> str:
 
 
 def format_phone(phone: str) -> str:
-    """Форматирует телефон для красивого отображения: +7 (988) 591-94-01"""
+    """Форматирует телефон для красивого отображения."""
+    if not phone:
+        return "—"
+    # Российский номер
     if len(phone) == 11 and phone.startswith("7"):
         return f"+7 ({phone[1:4]}) {phone[4:7]}-{phone[7:9]}-{phone[9:11]}"
-    return phone
+    # Международный номер с +
+    if phone.startswith("+"):
+        return phone
+    # Прочее — добавляем +
+    return f"+{phone}"
 
 
 def format_datetime(dt: Optional[datetime]) -> str:
@@ -387,14 +411,58 @@ async def resolve_procedure_service(
     """
     Находит услугу в каталоге по пресету или возвращает только название.
     Возвращает (service_id | None, отображаемое имя).
+    Для 'other' — fuzzy-поиск по частичному совпадению.
     """
     if procedure_key == "other":
         name = (custom_name or "Другая процедура").strip()
+        # Сначала точное совпадение
         result = await session.execute(
             select(Service).where(Service.name == name, Service.is_active == True)
         )
         svc = result.scalar_one_or_none()
-        return (svc.id if svc else None, name)
+        if svc:
+            return svc.id, svc.name
+
+        # Fuzzy: улучшенный поиск (подстрока → все слова → символьное пересечение)
+        result = await session.execute(
+            select(Service).where(Service.is_active == True)
+        )
+        name_lower = name.lower()
+        name_words = [w for w in name_lower.split() if len(w) >= 2]
+        all_services = list(result.scalars().all())
+
+        best_match = None
+        best_score = 0  # higher = better
+
+        for s in all_services:
+            svc_lower = s.name.lower()
+            # 1) Exact substring match (search term inside service name) — best
+            if name_lower in svc_lower:
+                score = 100 + len(name_lower)
+                if score > best_score:
+                    best_score = score
+                    best_match = s
+                continue
+            # 2) Reverse: service name inside search term
+            if svc_lower in name_lower:
+                score = 80 + len(svc_lower)
+                if score > best_score:
+                    best_score = score
+                    best_match = s
+                continue
+            # 3) All search words appear in service name
+            if name_words and all(w in svc_lower for w in name_words):
+                score = 60 + sum(len(w) for w in name_words)
+                if score > best_score:
+                    best_score = score
+                    best_match = s
+                continue
+
+        if best_match:
+            return best_match.id, best_match.name
+
+        # Не нашли — возвращаем как кастомную процедуру (service_id=None, это ОК)
+        return None, name
 
     display_name = PROCEDURE_PRESETS.get(procedure_key, custom_name or "Процедура")
     result = await session.execute(
@@ -552,6 +620,7 @@ async def add_bonus_transaction(
     amount: int,
     description: str,
     booking_id: Optional[int] = None,
+    tx_type: str = "MANUAL",
 ) -> None:
     """
     Создаёт запись о бонусной транзакции (начисление или списание).
@@ -560,6 +629,7 @@ async def add_bonus_transaction(
     tx = BonusTransaction(
         user_id=user_id,
         amount=amount,
+        tx_type=tx_type,
         booking_id=booking_id,
         description=description,
     )
@@ -592,8 +662,8 @@ async def _booking_has_confirmation_bonus(
         select(BonusTransaction.id)
         .where(
             BonusTransaction.booking_id == booking_id,
+            BonusTransaction.tx_type == BonusTransaction.TX_CONFIRM_BONUS,
             BonusTransaction.amount > 0,
-            BonusTransaction.description.contains("при подтверждении"),
         )
         .limit(1)
     )
@@ -604,14 +674,26 @@ async def grant_confirmation_bonus(
     session: AsyncSession, booking: Booking,
 ) -> int:
     """
-    Начисляет 3% бонусов клиентке при подтверждении записи.
+    Начисляет бонусы за лояльность при подтверждении записи.
+    Скидка зависит от количества завершённых визитов:
+      0 визитов (новый клиент) → 0%
+      1-2 визита → 3%
+      3+ визитов → 5%
     Возвращает сумму начисления или 0.
     """
     if await _booking_has_confirmation_bonus(session, booking.id):
         return 0
 
+    # Считаем завершённые визиты клиента (кроме текущей записи)
+    completed_count = await _count_completed_visits(session, booking.user_id, exclude_booking_id=booking.id)
+
+    # Определяем процент скидки за лояльность
+    discount_pct = get_loyalty_discount_percent(completed_count)
+    if discount_pct <= 0:
+        return 0
+
     price = calculate_booking_price(booking)
-    amount = confirmation_bonus_amount(price)
+    amount = price * discount_pct // 100
     if amount <= 0:
         return 0
 
@@ -630,15 +712,43 @@ async def grant_confirmation_bonus(
         session,
         booking.user_id,
         amount,
-        f"Бонус {Config.BONUS_PERCENT}% при подтверждении записи #{booking.id}",
+        f"Бонус {discount_pct}% за лояльность ({completed_count} визитов) при подтверждении записи #{booking.id}",
         booking_id=booking.id,
+        tx_type=BonusTransaction.TX_CONFIRM_BONUS,
     )
     await session.flush()
     logger.info(
-        "Подтверждение #%s: +%s бонусов клиенту %s (услуги %s₽)",
-        booking.id, amount, booking.user_id, price,
+        "Подтверждение #%s: +%s бонусов (%d%% за %d визитов) клиенту %s",
+        booking.id, amount, discount_pct, completed_count, booking.user_id,
     )
     return amount
+
+
+async def _count_completed_visits(
+    session: AsyncSession, user_id: int, exclude_booking_id: int = 0,
+) -> int:
+    """Считает количество завершённых визитов клиента."""
+    from sqlalchemy import func as sa_func
+    result = await session.execute(
+        select(sa_func.count(Booking.id))
+        .where(
+            Booking.user_id == user_id,
+            Booking.status == "completed",
+            Booking.id != exclude_booking_id,
+        )
+    )
+    return result.scalar() or 0
+
+
+def get_loyalty_discount_percent(completed_visits: int) -> int:
+    """
+    Возвращает процент скидки за лояльность по количеству завершённых визитов.
+    """
+    discount = 0
+    for min_visits, pct in Config.LOYALTY_DISCOUNT_TIERS:
+        if completed_visits >= min_visits:
+            discount = pct
+    return discount
 
 
 # =============================================================================
@@ -674,8 +784,10 @@ async def get_active_booking(
     Возвращает последнюю активную запись (pending/confirmed).
     Отменённые (cancelled) и завершённые не учитываются.
     """
+    from sqlalchemy.orm import joinedload
     result = await session.execute(
         select(Booking)
+        .options(joinedload(Booking.service))
         .where(
             Booking.user_id == user_id,
             Booking.status.in_(ACTIVE_BOOKING_STATUSES),
@@ -683,7 +795,7 @@ async def get_active_booking(
         .order_by(Booking.created_at.desc())
         .limit(1)
     )
-    return result.scalar_one_or_none()
+    return result.unique().scalar_one_or_none()
 
 
 async def cancel_booking_by_id(
@@ -1087,7 +1199,10 @@ async def notify_client_booking_cancelled(
         f"\nСвяжитесь с Ашурой: {format_phone(Config.SALON_PHONE)}\n"
         "или запишитесь заново через бот."
     )
-    await bot.send_message(chat_id=telegram_id, text=text)
+    try:
+        await bot.send_message(chat_id=telegram_id, text=text)
+    except Exception as e:
+        logger.warning('Failed to notify client %s: %s', telegram_id, e)
 
 
 async def notify_client_booking_confirmed(
@@ -1097,6 +1212,7 @@ async def notify_client_booking_confirmed(
     *,
     service_name: Optional[str] = None,
     bonus_granted: int = 0,
+    discount_percent: int = 0,
 ) -> None:
     """Отправляет клиенту подтверждение записи."""
     # service_name передаём явно — без lazy-load relationship (greenlet_spawn)
@@ -1112,17 +1228,20 @@ async def notify_client_booking_confirmed(
     )
     if bonus_granted > 0:
         text += (
-            f"\n\n🎁 <b>Вам начислено +{bonus_granted} бонусов</b> "
-            f"({Config.BONUS_PERCENT}% скидка на следующую запись)!\n"
+            f"\n\n🎁 <b>Скидка за лояльность: {discount_percent}%</b>\n"
+            f"Вам начислено +{bonus_granted} бонусов!\n"
             f"💰 Баланс: {booking.user.bonus_balance} бонусов"
         )
     text += "\n\nЖду вас! 💫"
 
-    await bot.send_message(
-        chat_id=telegram_id,
-        text=text,
-        parse_mode="HTML",
-    )
+    try:
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=text,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning('Failed to notify client %s: %s', telegram_id, e)
 
 
 # =============================================================================
@@ -1178,7 +1297,11 @@ async def get_stats(
         select(func.count(Review.id), func.avg(Review.rating))
         .where(Review.is_published == True)
     )
-    review_count, avg_rating = reviews_result.one()
+    row = reviews_result.one_or_none()
+    if row:
+        review_count, avg_rating = row
+    else:
+        review_count, avg_rating = 0, 0
     review_count = review_count or 0
     avg_rating = round(avg_rating, 1) if avg_rating else 0
 
