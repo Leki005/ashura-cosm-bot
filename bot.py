@@ -739,23 +739,24 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
 
     # Автоматический сброс просроченных записей (каждые 5 мин)
     async def _expire_old_bookings(bot_ref=bot):
-        """Помечает НЕПОДТВЕРЖДЁННЫЕ записи как expired, если время уже прошло.
-        Подтверждённые записи НЕ expire — админ явно одобрил визит."""
+        """Помечает просроченные записи:
+        - pending + время прошло → expired (клиент не пришёл, админ не подтвердил)
+        - confirmed + время прошло (+2ч буфер) → cancelled (клиент не пришёл)
+        Уведомляет клиента 1 раз."""
         from database import Booking, User
         from utils.helpers import now_salon, format_booking_services_line
         from sqlalchemy.orm import joinedload
         from sqlalchemy import update as sa_update
+        from datetime import timedelta
 
         now = now_salon()
-        today_str = now.strftime("%d.%m.%Y")
+        buffer = timedelta(hours=2)  # даём 2 часа после записи
 
         async with async_session() as session:
-            # Ищем ТОЛЬКО pending записи, у которых дата+время уже прошли
-            # confirmed НЕ трогаем — админ подтвердил, значит визит состоится
             result = await session.execute(
                 select(Booking)
                 .options(joinedload(Booking.user), joinedload(Booking.service))
-                .where(Booking.status == "pending")
+                .where(Booking.status.in_(["pending", "confirmed"]))
                 .where(Booking.preferred_date.isnot(None))
             )
             all_bookings = result.scalars().unique().all()
@@ -767,51 +768,65 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
 
                 try:
                     from datetime import datetime as dt
-                    # Парсим дату и время
                     slot_str = f"{b.preferred_date} {b.preferred_time}"
                     slot_dt = dt.strptime(slot_str, "%d.%m.%Y %H:%M")
-                    # Если время прошло — помечаем как expired
-                    if slot_dt < now:
-                        # Атомарно меняем статус — только pending
+
+                    if slot_dt + buffer < now:
+                        new_status = "cancelled" if b.status == "confirmed" else "expired"
+                        bonus_amount = b.bonus_used or 0
+
+                        # Атомарно: статус + обнуление бонусов в одном UPDATE
                         r = await session.execute(
                             sa_update(Booking)
-                            .where(Booking.id == b.id, Booking.status == "pending")
-                            .values(status="expired")
+                            .where(Booking.id == b.id, Booking.status == b.status)
+                            .values(status=new_status, bonus_used=0)
                         )
                         if r.rowcount > 0:
                             expired_count += 1
-                            logger.info("Запись #%s просрочена (%s %s), помечена expired",
-                                       b.id, b.preferred_date, b.preferred_time)
-                            # Возврат бонусов, которые клиент потратил
-                            if b.bonus_used and b.bonus_used > 0:
+                            logger.info("Запись #%s (%s %s) → %s",
+                                       b.id, b.preferred_date, b.preferred_time, new_status)
+
+                            # Возврат бонусов
+                            if bonus_amount > 0:
                                 user = b.user
                                 if user:
                                     from sqlalchemy import update as sa_update_u
                                     await session.execute(
-                                        sa_update_u(User).where(User.id == user.id).values(bonus_balance=User.bonus_balance + b.bonus_used)
+                                        sa_update_u(User).where(User.id == user.id).values(bonus_balance=User.bonus_balance + bonus_amount)
                                     )
                                     from utils.helpers import add_bonus_transaction
-                                    await add_bonus_transaction(session, user.id, b.bonus_used, f'Возврат при истечении записи #{b.id}', booking_id=b.id, tx_type='REFUND')
-                                    b.bonus_used = 0
-                            # Уведомляем клиента
+                                    await add_bonus_transaction(session, user.id, bonus_amount, f'Возврат при истечении записи #{b.id}', booking_id=b.id, tx_type='REFUND')
+                                else:
+                                    logger.error("Запись #%s: бонусы %s НЕ возвращены — пользователь не найден!", b.id, bonus_amount)
+
+                            # Уведомляем клиента 1 раз
                             try:
                                 tg_id = b.user.telegram_id if b.user else None
                                 if tg_id:
                                     svc_name = format_booking_services_line(b)
-                                    await bot_ref.send_message(
-                                        chat_id=tg_id,
-                                        text=(
+                                    if new_status == "cancelled":
+                                        text = (
+                                            f"⏰ <b>Время записи прошло</b>\n\n"
+                                            f"💅 {svc_name}\n"
+                                            f"📅 {b.preferred_date} {b.preferred_time}\n\n"
+                                            f"Запись автоматически отменена. Если хотите записаться снова — "
+                                            f"нажмите /start"
+                                        )
+                                    else:
+                                        text = (
                                             f"⏰ <b>Запись истекла</b>\n\n"
                                             f"💅 {svc_name}\n"
                                             f"📅 {b.preferred_date} {b.preferred_time}\n\n"
                                             f"Время записи прошло. Если хотите записаться снова — "
                                             f"нажмите /start"
-                                        ),
-                                        parse_mode="HTML",
+                                        )
+                                    await bot_ref.send_message(
+                                        chat_id=tg_id, text=text, parse_mode="HTML",
                                     )
                             except Exception as e:
                                 logger.warning("Не удалось уведомить о просрочке %s: %s", tg_id, e)
-                except (ValueError, TypeError):
+                except Exception as e:
+                    logger.error("Ошибка при обработке записи #%s: %s", b.id, e)
                     continue
 
             if expired_count > 0:

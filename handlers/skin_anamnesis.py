@@ -8,7 +8,7 @@ import logging
 from html import escape as html_escape
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -68,10 +68,14 @@ SKIN_BUDGET_CHOICES = [
 # =============================================================================
 
 async def _safe_edit_markup(message: Message, markup) -> None:
+    import asyncio
     try:
         await message.edit_reply_markup(reply_markup=markup)
     except TelegramBadRequest as e:
         logger.debug("edit_markup failed (expected on double-tap): %s", e)
+    except TelegramRetryAfter as e:
+        logger.warning("Rate limited on edit_markup: retry after %ds", e.retry_after)
+        await asyncio.sleep(e.retry_after)
 
 
 def _progress(q: int) -> str:
@@ -218,9 +222,9 @@ async def skin_restart(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 _Q_KEYS = {
-    1: "age", 2: "skin_type", 3: "condition", 4: "problems", 5: "problem_areas",
+    1: "age", 2: "skin_type", 3: "skin_condition", 4: "problems", 5: "problem_areas",
     6: "duration", 7: "inflammation", 8: "home_care", 9: "pro_care",
-    10: "allergy", 11: "goals", 12: "budget",
+    10: "allergies", 11: "goals", 12: "budget",
 }
 
 
@@ -246,9 +250,9 @@ async def skin_back(callback: CallbackQuery, state: FSMContext) -> None:
     if q > 1:
         await state.update_data(skin_q=q - 1, skin_selected=[])
         await _ask_question(callback.message, state)
+        await callback.answer()
     else:
         await callback.answer("Это первый вопрос", show_alert=True)
-    await callback.answer()
 
 
 # =============================================================================
@@ -940,6 +944,20 @@ async def _show_final(message: Message, state: FSMContext, session: AsyncSession
     import asyncio
 
     data = await state.get_data()
+    if data.get("_skin_finalizing"):
+        return
+    await state.update_data(_skin_finalizing=True)
+
+    try:
+        await _show_final_inner(message, state, session, telegram_id)
+    finally:
+        await state.update_data(_skin_finalizing=False)
+
+
+async def _show_final_inner(message: Message, state: FSMContext, session: AsyncSession, telegram_id: int = 0) -> None:
+    import asyncio
+
+    data = await state.get_data()
     answers = data.get("skin_answers", {})
 
     # Анимация завершения — 3 кадра
@@ -1047,21 +1065,23 @@ def _build_report(answers: dict) -> str:
     def _list(names: dict, values: list) -> str:
         return ", ".join(names.get(v, v) for v in values) if values else "—"
 
+    def esc(v):
+        return html_escape(str(v)) if v else '—'
     lines = [
         "✅ <b>АНАМНЕЗ СОБРАН!</b>\n",
         "📋 <b>ТВОЙ ПРОФИЛЬ:</b>",
-        f"• Возраст: {answers.get('age', '—')}",
-        f"• Тип кожи: {type_names.get(answers.get('skin_type', ''), answers.get('skin_type', '—'))}",
-        f"• Состояние: {condition_names.get(answers.get('skin_condition', ''), '—')}",
+        f"• Возраст: {esc(answers.get('age', '—'))}",
+        f"• Тип кожи: {esc(type_names.get(answers.get('skin_type', ''), answers.get('skin_type', '—')))}",
+        f"• Состояние: {esc(condition_names.get(answers.get('skin_condition', ''), '—'))}",
         f"• Проблемы: {_list(problem_names, answers.get('problems', []))}",
-        f"• Зоны: {', '.join(answers.get('problem_areas', [])) or '—'}",
-        f"• Давность: {dur_names.get(answers.get('duration', ''), '—')}",
-        f"• Воспаление: {infl_names.get(answers.get('inflammation', ''), '—')}",
+        f"• Зоны: {esc(', '.join(answers.get('problem_areas', [])) or '—')}",
+        f"• Давность: {esc(dur_names.get(answers.get('duration', ''), '—'))}",
+        f"• Воспаление: {esc(infl_names.get(answers.get('inflammation', ''), '—'))}",
         f"• Домашний уход: {_list(care_names, answers.get('home_care', []))}",
         f"• Процедуры: {_list(pro_names, answers.get('pro_care', []))}",
-        f"• Аллергии: {allergy_names.get(answers.get('allergies', ''), '—')}",
+        f"• Аллергии: {esc(allergy_names.get(answers.get('allergies', ''), '—'))}",
         f"• Цели: {_list(goal_names, answers.get('goals', []))}",
-        f"• Бюджет: {budget_names.get(answers.get('budget', ''), '—')}",
+        f"• Бюджет: {esc(budget_names.get(answers.get('budget', ''), '—'))}",
     ]
     if answers.get("comment"):
         lines.append(f"• Комментарий: {html_escape(answers['comment'])}")

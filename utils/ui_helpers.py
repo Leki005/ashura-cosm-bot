@@ -13,10 +13,13 @@ def progress_bar(q: int, total: int = 11) -> str:
     Примеры:
         Шаг 1  →  ▓░░░░░░░░░ 0%
         Шаг 5  →  ▓▓▓▓░░░░░░ 36%
-        Шаг 11 →  ▓▓▓▓▓▓▓▓▓▓ 91%
+        Шаг 11 →  ▓▓▓▓▓▓▓▓▓▓ 100%
     """
-    pct = round((q - 1) / total * 100)
-    filled = round((q - 1) / total * 10)
+    if q >= total:
+        pct, filled = 100, 10
+    else:
+        pct = round((q - 1) / total * 100)
+        filled = round((q - 1) / total * 10)
     bar = "▓" * filled + "░" * (10 - filled)
 
     if q == 1:

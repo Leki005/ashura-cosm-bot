@@ -2929,12 +2929,14 @@ async def cancel_booking_confirm(
         return
 
     # Дедлайн: нельзя отменить за < N часов до приёма (настраивается в config)
+    # Если время уже прошло — отменяем без ограничений
     if booking_check.preferred_date and booking_check.preferred_time:
         from utils.helpers import booking_slot_datetime, now_salon
         from datetime import timedelta
         slot_dt = booking_slot_datetime(booking_check.preferred_date, booking_check.preferred_time)
+        now = now_salon()
         deadline = timedelta(hours=Config.CANCEL_DEADLINE_HOURS)
-        if slot_dt and slot_dt - now_salon() < deadline:
+        if slot_dt and slot_dt > now and slot_dt - now < deadline:
             await callback.answer(
                 f"❌ Отмена невозможна менее чем за {Config.CANCEL_DEADLINE_HOURS} ч. до приёма.\n"
                 "Свяжитесь с Ашурой напрямую.",
