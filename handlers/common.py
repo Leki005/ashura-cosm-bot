@@ -460,13 +460,23 @@ async def cmd_menu(
 
 
 async def _do_restart(message: Message, state: FSMContext) -> None:
-    """Сбрасывает FSM и показывает главное меню. Записи в БД не трогаем."""
+    """Сбрасывает FSM, согласие и анамнез. Записи в БД не трогаем."""
     await state.clear()
+    # Сбрасываем согласие и анамнез в БД
+    from database import async_session, User
+    from sqlalchemy import update as sa_update
+    async with async_session() as session:
+        await session.execute(
+            sa_update(User)
+            .where(User.telegram_id == message.from_user.id)
+            .values(pd_consent_at=None, pd_consent_version=None,
+                    skin_anamnesis_json=None, skin_anamnesis_at=None)
+        )
+        await session.commit()
     await show_client_home(
         message,
         f"🔄 Бот перезапущен.\n\n"
-        f"Вы в главном меню <b>{Config.SALON_NAME}</b>.\n"
-        f"Ваши данные и записи сохранены.",
+        f"Данные сброшены. Нажмите /start для начала.",
     )
 
 
